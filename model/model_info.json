@@ -1,0 +1,24 @@
+{
+  "input_dim": 4800,
+  "hidden_dims": [
+    512,
+    256,
+    128
+  ],
+  "output_dim": 9,
+  "image_size": [
+    80,
+    60
+  ],
+  "action_columns": [
+    "moving_left",
+    "moving_right",
+    "moving_up",
+    "moving_down",
+    "attacking",
+    "jumping",
+    "dashing",
+    "focusing",
+    "dreamnail"
+  ]
+}
