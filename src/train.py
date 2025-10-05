@@ -107,10 +107,11 @@ class HollowKnightDataset(Dataset):
         
         return features, actions
 
+
 class BehavioralCloningNet(nn.Module):
     def __init__(self, input_dim, hidden_dims=[512, 256, 128], output_dim=5, dropout_rate=0.3):
         """
-        Neural network for behavioral cloning
+        Neural network for multi-label behavioral cloning
         
         Args:
             input_dim: Input dimension (image features + position data)
@@ -133,14 +134,16 @@ class BehavioralCloningNet(nn.Module):
             ])
             prev_dim = hidden_dim
         
-        # Output layer
+        # Output layer - NO SIGMOID (BCEWithLogitsLoss handles it)
         layers.append(nn.Linear(prev_dim, output_dim))
-        layers.append(nn.Sigmoid())  # Sigmoid for binary actions
         
         self.network = nn.Sequential(*layers)
     
     def forward(self, x):
         return self.network(x)
+
+
+
 
 class BehavioralCloningTrainer:
     def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu'):
@@ -152,35 +155,151 @@ class BehavioralCloningTrainer:
         self.train_losses = []
         self.val_losses = []
         self.val_accuracies = []
+        self.per_action_accuracies = []
     
+    def save_checkpoint(self, filepath):
+        """Save model checkpoint"""
+        torch.save(self.model.state_dict(), filepath)
+    
+    def load_checkpoint(self, filepath):
+        """Load model checkpoint"""
+        self.model.load_state_dict(torch.load(filepath, map_location=self.device))
+    
+    def validate(self, val_loader, criterion):
+        """Validate the model with multi-label metrics"""
+        self.model.eval()
+        val_loss = 0
+        exact_matches = 0
+        total_samples = 0
+        
+        # Per-action accuracy tracking
+        action_correct = torch.zeros(5).to(self.device)
+        action_total = torch.zeros(5).to(self.device)
+        
+        with torch.no_grad():
+            for features, actions in val_loader:
+                features, actions = features.to(self.device), actions.to(self.device)
+                outputs = self.model(features)
+                
+                # Calculate loss
+                loss = criterion(outputs, actions)
+                val_loss += loss.item()
+                
+                # Apply sigmoid to get probabilities
+                probabilities = torch.sigmoid(outputs)
+                predicted = (probabilities > 0.5).float()
+                
+                # Exact match accuracy (all actions must match)
+                exact_match = (predicted == actions).all(dim=1).float()
+                exact_matches += exact_match.sum().item()
+                total_samples += actions.size(0)
+                
+                # Per-action accuracy
+                for i in range(5):  # 5 actions
+                    action_correct[i] += (predicted[:, i] == actions[:, i]).sum().item()
+                    action_total[i] += actions.size(0)
+        
+        avg_val_loss = val_loss / len(val_loader)
+        exact_match_accuracy = exact_matches / total_samples
+        
+        # Calculate per-action accuracies
+        per_action_accuracies = []
+        for i in range(5):
+            acc = action_correct[i].item() / action_total[i].item()
+            per_action_accuracies.append(acc)
+        
+        return avg_val_loss, exact_match_accuracy, per_action_accuracies
+    
+    def plot_training_history(self):
+        """Plot training metrics"""
+        if not self.train_losses:
+            print("No training history to plot")
+            return
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Training and validation loss
+        axes[0, 0].plot(self.train_losses, label='Training Loss')
+        axes[0, 0].plot(self.val_losses, label='Validation Loss')
+        axes[0, 0].set_title('Loss Over Time')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True)
+        
+        # Exact match accuracy
+        axes[0, 1].plot(self.val_accuracies, label='Exact Match Accuracy', color='green')
+        axes[0, 1].set_title('Exact Match Accuracy Over Time')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Accuracy')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True)
+        
+        # Per-action accuracy over time
+        if self.per_action_accuracies:
+            action_names = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
+            per_action_array = np.array(self.per_action_accuracies)
+            
+            for i, action in enumerate(action_names):
+                axes[1, 0].plot(per_action_array[:, i], label=action)
+            
+            axes[1, 0].set_title('Per-Action Accuracy Over Time')
+            axes[1, 0].set_xlabel('Epoch')
+            axes[1, 0].set_ylabel('Accuracy')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True)
+        
+        # Final per-action accuracy bar chart
+        if self.per_action_accuracies:
+            final_accuracies = self.per_action_accuracies[-1]
+            action_names = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
+            
+            bars = axes[1, 1].bar(action_names, final_accuracies)
+            axes[1, 1].set_title('Final Per-Action Accuracy')
+            axes[1, 1].set_xlabel('Action')
+            axes[1, 1].set_ylabel('Accuracy')
+            axes[1, 1].set_ylim(0, 1)
+            
+            # Add value labels on bars
+            for bar, acc in zip(bars, final_accuracies):
+                axes[1, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, 
+                               f'{acc:.3f}', ha='center', va='bottom')
+            
+            # Rotate x-labels for better readability
+            axes[1, 1].tick_params(axis='x', rotation=45)
+        
+        plt.tight_layout()
+        plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
+        plt.show()
+        print("Training history plot saved as 'training_history.png'")
+
     def train(self, train_loader, val_loader, epochs=50, learning_rate=0.001):
-        """Train the behavioral cloning model"""
+        """Train the behavioral cloning model for multi-label classification"""
         
-        # Calculate class weights to handle imbalance
-        print("\n=== Calculating class weights ===")
-        action_sums = []
-        for col in ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']:
-            action_sum = train_loader.dataset.dataset.data[col].sum()
-            action_sums.append(action_sum)
-        
-        total_samples = len(train_loader.dataset.dataset.data)
+        # Calculate class weights for each action independently
+        print("\n=== Calculating per-action class weights ===")
         pos_weights = []
-        for i, action_sum in enumerate(action_sums):
-            if action_sum > 0:
-                # Weight = total_negative / total_positive
-                neg_samples = total_samples - action_sum
-                weight = neg_samples / action_sum
+        
+        for i, col in enumerate(['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']):
+            positive_samples = train_loader.dataset.dataset.data[col].sum()
+            total_samples = len(train_loader.dataset.dataset.data)
+            negative_samples = total_samples - positive_samples
+            
+            if positive_samples > 0:
+                # For multi-label: weight = negative_samples / positive_samples
+                weight = negative_samples / positive_samples
                 pos_weights.append(weight)
-                print(f"Action {i}: weight = {weight:.2f}")
+                print(f"{col:15s}: pos={positive_samples:5d}, neg={negative_samples:5d}, weight={weight:.2f}")
             else:
                 pos_weights.append(1.0)
+                print(f"{col:15s}: pos={positive_samples:5d}, neg={negative_samples:5d}, weight=1.00 (no positives)")
         
         pos_weights = torch.FloatTensor(pos_weights).to(self.device)
         
-        # Use weighted BCE loss
-        criterion = nn.BCELoss(reduction='none')
-        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10)
+        # Use BCEWithLogitsLoss with pos_weight for multi-label classification
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
         
         print(f"\nTraining on {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
@@ -200,20 +319,21 @@ class BehavioralCloningTrainer:
                 optimizer.zero_grad()
                 outputs = self.model(features)
                 
-                # Apply weighted loss
-                loss_per_sample = criterion(outputs, actions)
-                weighted_loss = loss_per_sample * pos_weights.unsqueeze(0)
-                loss = weighted_loss.mean()
+                # BCEWithLogitsLoss expects raw logits, not sigmoid outputs
+                loss = criterion(outputs, actions)
                 
                 loss.backward()
-                optimizer.step()
                 
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
                 train_loss += loss.item()
             
             avg_train_loss = train_loss / len(train_loader)
             
             # Validation
-            val_loss, val_accuracy = self.validate(val_loader, criterion, pos_weights)
+            val_loss, val_accuracy, per_action_acc = self.validate(val_loader, criterion)
             
             # Learning rate scheduling
             scheduler.step(val_loss)
@@ -230,9 +350,13 @@ class BehavioralCloningTrainer:
             self.train_losses.append(avg_train_loss)
             self.val_losses.append(val_loss)
             self.val_accuracies.append(val_accuracy)
+            self.per_action_accuracies.append(per_action_acc)
             
+            # Enhanced logging
+            per_action_str = ", ".join([f"{acc:.2f}" for acc in per_action_acc])
             print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, "
-                  f"Val Loss: {val_loss:.4f}, Exact Match Acc: {val_accuracy:.4f}")
+                  f"Val Loss: {val_loss:.4f}, Exact Match: {val_accuracy:.3f}")
+            print(f"    Per-action accuracy: [{per_action_str}]")
             
             # Early stopping
             if patience_counter >= patience:
@@ -242,76 +366,6 @@ class BehavioralCloningTrainer:
         # Load best model
         self.load_checkpoint('best_model.pth')
         print("Training completed!")
-    
-    def validate(self, val_loader, criterion, pos_weights):
-        """Validate the model - exact match accuracy"""
-        self.model.eval()
-        val_loss = 0
-        exact_matches = 0
-        total_samples = 0
-        
-        with torch.no_grad():
-            for features, actions in val_loader:
-                features, actions = features.to(self.device), actions.to(self.device)
-                outputs = self.model(features)
-                
-                # Calculate weighted loss
-                loss_per_sample = criterion(outputs, actions)
-                weighted_loss = loss_per_sample * pos_weights.unsqueeze(0)
-                loss = weighted_loss.mean()
-                val_loss += loss.item()
-                
-                # Calculate exact match accuracy (all actions must match)
-                predicted = (outputs > 0.5).float()
-                exact_match = (predicted == actions).all(dim=1).float()
-                exact_matches += exact_match.sum().item()
-                total_samples += actions.size(0)
-        
-        avg_val_loss = val_loss / len(val_loader)
-        accuracy = exact_matches / total_samples
-        
-        return avg_val_loss, accuracy
-    
-    def save_checkpoint(self, filepath):
-        """Save model checkpoint"""
-        torch.save({
-            'model_state_dict': self.model.state_dict(),
-            'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
-            'val_accuracies': self.val_accuracies,
-        }, filepath)
-    
-    def load_checkpoint(self, filepath):
-        """Load model checkpoint"""
-        checkpoint = torch.load(filepath, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.train_losses = checkpoint.get('train_losses', [])
-        self.val_losses = checkpoint.get('val_losses', [])
-        self.val_accuracies = checkpoint.get('val_accuracies', [])
-    
-    def plot_training_history(self):
-        """Plot training history"""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-        
-        # Loss plot
-        ax1.plot(self.train_losses, label='Train Loss')
-        ax1.plot(self.val_losses, label='Validation Loss')
-        ax1.set_title('Training and Validation Loss')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.legend()
-        ax1.grid(True)
-        
-        # Accuracy plot
-        ax2.plot(self.val_accuracies, label='Exact Match Accuracy')
-        ax2.set_title('Validation Exact Match Accuracy')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Accuracy')
-        ax2.legend()
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        plt.show()
 
 def export_model_for_inference(model, image_size, output_dir='model'):
     """
@@ -402,6 +456,27 @@ def main():
         print("No valid data found!")
         return
     
+    # Add detailed analysis of action distribution
+    print("\n=== Detailed Action Analysis ===")
+    df = dataset.data
+    for col in dataset.action_columns:
+        true_count = df[col].sum()
+        false_count = len(df) - true_count
+        ratio = true_count / false_count if false_count > 0 else float('inf')
+        print(f"{col:15s}: True={true_count:5d}, False={false_count:5d}, Ratio={ratio:.3f}")
+    
+    # Check for data quality issues
+    print("\n=== Data Quality Check ===")
+    # Check if player is always moving left
+    always_left = df['moving_left'].all()
+    never_right = not df['moving_right'].any()
+    print(f"Always moving left: {always_left}")
+    print(f"Never moving right: {never_right}")
+    
+    # Check position variance
+    pos_variance = df[['x_position', 'y_position']].var()
+    print(f"Position variance - X: {pos_variance['x_position']:.2f}, Y: {pos_variance['y_position']:.2f}")
+    
     # Split data
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
@@ -418,7 +493,8 @@ def main():
     model = BehavioralCloningNet(
         input_dim=input_dim,
         hidden_dims=[512, 256, 128],
-        output_dim=len(dataset.action_columns)  # Now 5 actions instead of 9
+        output_dim=len(dataset.action_columns),
+        dropout_rate=0.5  # Increase dropout to reduce overfitting
     )
     
     print(f"Model input dimension: {input_dim}")
@@ -426,8 +502,8 @@ def main():
     # Create trainer
     trainer = BehavioralCloningTrainer(model)
     
-    # Train model
-    trainer.train(train_loader, val_loader, epochs=EPOCHS, learning_rate=LEARNING_RATE)
+    # Train model with adjusted learning rate
+    trainer.train(train_loader, val_loader, epochs=EPOCHS, learning_rate=0.0005)  # Lower learning rate
     
     # Plot training history
     trainer.plot_training_history()
@@ -447,6 +523,7 @@ def main():
     if os.path.exists('best_model.pth'):
         os.remove('best_model.pth')
     print("Cleaned up temporary checkpoint file")
+
 
 if __name__ == "__main__":
     main()

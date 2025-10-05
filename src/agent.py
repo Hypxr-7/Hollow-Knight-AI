@@ -8,6 +8,7 @@ import base64
 from pathlib import Path
 import pyautogui
 import time
+import threading
 
 class BehavioralCloningNet(nn.Module):
     def __init__(self, input_dim, hidden_dims=[512, 256, 128], output_dim=5, dropout_rate=0.3):
@@ -25,8 +26,8 @@ class BehavioralCloningNet(nn.Module):
             ])
             prev_dim = hidden_dim
         
+        # Remove the sigmoid - model outputs raw logits
         layers.append(nn.Linear(prev_dim, output_dim))
-        layers.append(nn.Sigmoid())
         
         self.network = nn.Sequential(*layers)
     
@@ -71,9 +72,43 @@ class HollowKnightAI:
         # Track currently pressed keys
         self.pressed_keys = set()
         
+        # Jump timing control
+        self.jump_start_time = None
+        self.jump_duration = 2.0  # 2 seconds
+        
         print(f"Model loaded - Image size: {self.image_size}, Input dim: {self.model_info['input_dim']}")
         print(f"Action columns: {self.action_columns}")
     
+    def _handle_jump_timing(self, should_jump):
+        """Handle jump key timing - keep pressed for 2 seconds once triggered"""
+        current_time = time.time()
+        jump_key = self.action_keys['jumping']
+        
+        if should_jump and self.jump_start_time is None:
+            # Start jump
+            self.jump_start_time = current_time
+            if jump_key not in self.pressed_keys:
+                pyautogui.keyDown(jump_key)
+                self.pressed_keys.add(jump_key)
+        
+        # Check if jump duration has elapsed
+        if self.jump_start_time is not None:
+            if current_time - self.jump_start_time >= self.jump_duration:
+                # End jump
+                if jump_key in self.pressed_keys:
+                    pyautogui.keyUp(jump_key)
+                    self.pressed_keys.discard(jump_key)
+                self.jump_start_time = None
+                return False  # Jump is no longer active
+            else:
+                return True  # Jump is still active
+        
+        return False
+    
+
+
+
+
     def predict_from_bytes(self, image_bytes, width, height, player_x=0.5, player_y=0.5, enemy_x=0.0, enemy_y=0.0):
         """Run prediction on image bytes and press keys"""
         try:
@@ -101,31 +136,102 @@ class HollowKnightAI:
             
             # Predict
             with torch.no_grad():
-                predictions = self.model(features_tensor).cpu().numpy()[0]
+                logits = self.model(features_tensor)
+                # Apply sigmoid to convert logits to probabilities
+                predictions = torch.sigmoid(logits).cpu().numpy()[0]
             
-            # Log predictions for debugging
+            # Enhanced debugging
             predictions_str = ", ".join([f"{action}:{pred:.3f}" for action, pred in zip(self.action_columns, predictions)])
             sys.stderr.write(f"Predictions: {predictions_str}\n")
-            sys.stderr.flush()
             
-            # Get keys to press (threshold 0.5)
+            # Handle jump timing first
+            should_jump = predictions[self.action_columns.index('jumping')] > 0.3 if 'jumping' in self.action_columns else False  # Lower jump threshold
+            jump_is_active = self._handle_jump_timing(should_jump)
+            
+            # Use lower, action-specific thresholds based on your data distribution
+            thresholds = {
+                'moving_left': 0.25,    # 20.6% in data, so lower threshold
+                'moving_right': 0.25,   # 22.1% in data, so lower threshold
+                'attacking': 0.35,      # 28.1% in data, higher threshold
+                'jumping': 0.3,         # 3.1% in data, much lower threshold
+                'dashing': 0.1          # 0% in data, very low threshold to encourage
+            }
+            
+            # Get keys to press
             keys_to_press = set()
-            for action, pred in zip(self.action_columns, predictions):
-                if pred > 0.5 and action in self.action_keys:
-                    keys_to_press.add(self.action_keys[action])
             
-            # Release keys that should no longer be pressed
+            for i, (action, pred) in enumerate(zip(self.action_columns, predictions)):
+                threshold = thresholds.get(action, 0.5)
+                
+                if action == 'jumping':
+                    if jump_is_active:
+                        keys_to_press.add(self.action_keys[action])
+                        sys.stderr.write(f"Jump active (timing)\n")
+                elif pred > threshold and action in self.action_keys:
+                    keys_to_press.add(self.action_keys[action])
+                    sys.stderr.write(f"Action triggered: {action} ({pred:.3f} > {threshold:.3f})\n")
+            
+            # Handle movement conflicts - your data shows these rarely happen together
+            if 'left' in keys_to_press and 'right' in keys_to_press:
+                left_pred = predictions[self.action_columns.index('moving_left')]
+                right_pred = predictions[self.action_columns.index('moving_right')]
+                
+                # Keep the stronger prediction
+                if left_pred > right_pred:
+                    keys_to_press.discard('right')
+                    sys.stderr.write(f"Conflict resolved: keeping left ({left_pred:.3f}) over right ({right_pred:.3f})\n")
+                else:
+                    keys_to_press.discard('left')
+                    sys.stderr.write(f"Conflict resolved: keeping right ({right_pred:.3f}) over left ({left_pred:.3f})\n")
+            
+            # Anti-spam: only change if predictions are confident enough or significantly different
+            if hasattr(self, 'last_predictions'):
+                # Check if any action crossed its threshold significantly
+                significant_change = False
+                for i, (action, pred) in enumerate(zip(self.action_columns, predictions)):
+                    last_pred = self.last_predictions[i]
+                    threshold = thresholds.get(action, 0.5)
+                    
+                    # Check for threshold crossing
+                    if (pred > threshold and last_pred <= threshold) or (pred <= threshold and last_pred > threshold):
+                        significant_change = True
+                        sys.stderr.write(f"Significant change in {action}: {last_pred:.3f} -> {pred:.3f} (threshold: {threshold:.3f})\n")
+                        break
+                
+                if not significant_change:
+                    # Keep current state if no significant changes
+                    sys.stderr.write("No significant prediction changes, maintaining current state\n")
+                    return list(self.pressed_keys)
+            
+            self.last_predictions = predictions.copy()
+            
+            # Release keys that should no longer be pressed (excluding jump)
             keys_to_release = self.pressed_keys - keys_to_press
+            jump_key = self.action_keys['jumping']
+            keys_to_release.discard(jump_key)  # Don't auto-release jump key
+            
             for key in keys_to_release:
                 pyautogui.keyUp(key)
+                sys.stderr.write(f"Released key: {key}\n")
             
-            # Press new keys
+            # Press new keys (excluding jump which is handled separately)
             keys_to_press_new = keys_to_press - self.pressed_keys
+            if jump_key in keys_to_press_new:
+                keys_to_press_new.discard(jump_key)  # Jump is handled separately
+            
             for key in keys_to_press_new:
                 pyautogui.keyDown(key)
+                sys.stderr.write(f"Pressed key: {key}\n")
             
             # Update pressed keys
             self.pressed_keys = keys_to_press
+            
+            # Log final action
+            if keys_to_press:
+                actions_str = ", ".join([action for action, key in self.action_keys.items() if key in keys_to_press])
+                sys.stderr.write(f"Final actions: {actions_str}\n")
+            else:
+                sys.stderr.write("Final actions: No actions (idle)\n")
             
             return list(keys_to_press)
             
@@ -133,7 +239,8 @@ class HollowKnightAI:
             print(f"ERROR:{e}", file=sys.stderr)
             sys.stderr.flush()
             return []
-    
+
+
     def release_all_keys(self):
         """Release all currently pressed keys"""
         for key in self.pressed_keys:
@@ -142,6 +249,8 @@ class HollowKnightAI:
             except:
                 pass
         self.pressed_keys.clear()
+        self.jump_start_time = None
+
 
 def main():
     """Main inference loop"""
