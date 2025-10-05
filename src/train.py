@@ -40,9 +40,8 @@ class HollowKnightDataset(Dataset):
         self.transform = transform
         self.image_size = image_size
         
-        # Action columns (excluding frame_id, positions, health)
-        self.action_columns = ['moving_left', 'moving_right', 'moving_up', 'moving_down',
-                              'attacking', 'jumping', 'dashing', 'focusing', 'dreamnail']
+        # Updated action columns to match new CSV structure
+        self.action_columns = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
         
         # Filter data to only include frames with existing images
         self.valid_indices = self._get_valid_indices()
@@ -57,6 +56,11 @@ class HollowKnightDataset(Dataset):
             count = self.data[col].sum()
             pct = (count / len(self.data)) * 100
             print(f"{col:15s}: {int(count):5d} frames ({pct:.1f}%)")
+        
+        # Analyze enemy presence
+        enemy_present = ((self.data['enemy_x'] != 0) | (self.data['enemy_y'] != 0)).sum()
+        enemy_pct = (enemy_present / len(self.data)) * 100
+        print(f"{'enemy_present':15s}: {int(enemy_present):5d} frames ({enemy_pct:.1f}%)")
     
     def _get_valid_indices(self):
         """Get indices of frames that have corresponding images"""
@@ -87,20 +91,29 @@ class HollowKnightDataset(Dataset):
         # Flatten image for neural network
         image_features = torch.FloatTensor(image).flatten()
         
+        # Add position and enemy information as additional features
+        player_x = torch.FloatTensor([row['x_position'] / 1920.0])  # Normalize assuming 1920 screen width
+        player_y = torch.FloatTensor([row['y_position'] / 1080.0])  # Normalize assuming 1080 screen height
+        enemy_x = torch.FloatTensor([row['enemy_x'] / 1920.0])
+        enemy_y = torch.FloatTensor([row['enemy_y'] / 1080.0])
+        
+        # Combine image features with position data
+        features = torch.cat([image_features, player_x, player_y, enemy_x, enemy_y])
+        
         # Get actions as binary vector
         actions = torch.FloatTensor([
             float(row[col]) for col in self.action_columns
         ])
         
-        return image_features, actions
+        return features, actions
 
 class BehavioralCloningNet(nn.Module):
-    def __init__(self, input_dim, hidden_dims=[512, 256, 128], output_dim=9, dropout_rate=0.3):
+    def __init__(self, input_dim, hidden_dims=[512, 256, 128], output_dim=5, dropout_rate=0.3):
         """
         Neural network for behavioral cloning
         
         Args:
-            input_dim: Input dimension (image features)
+            input_dim: Input dimension (image features + position data)
             hidden_dims: Hidden layer dimensions
             output_dim: Output dimension (number of actions)
             dropout_rate: Dropout rate for regularization
@@ -146,8 +159,7 @@ class BehavioralCloningTrainer:
         # Calculate class weights to handle imbalance
         print("\n=== Calculating class weights ===")
         action_sums = []
-        for col in ['moving_left', 'moving_right', 'moving_up', 'moving_down',
-                    'attacking', 'jumping', 'dashing', 'focusing', 'dreamnail']:
+        for col in ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']:
             action_sum = train_loader.dataset.dataset.data[col].sum()
             action_sums.append(action_sum)
         
@@ -182,11 +194,11 @@ class BehavioralCloningTrainer:
             self.model.train()
             train_loss = 0
             
-            for batch_idx, (images, actions) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")):
-                images, actions = images.to(self.device), actions.to(self.device)
+            for batch_idx, (features, actions) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")):
+                features, actions = features.to(self.device), actions.to(self.device)
                 
                 optimizer.zero_grad()
-                outputs = self.model(images)
+                outputs = self.model(features)
                 
                 # Apply weighted loss
                 loss_per_sample = criterion(outputs, actions)
@@ -239,9 +251,9 @@ class BehavioralCloningTrainer:
         total_samples = 0
         
         with torch.no_grad():
-            for images, actions in val_loader:
-                images, actions = images.to(self.device), actions.to(self.device)
-                outputs = self.model(images)
+            for features, actions in val_loader:
+                features, actions = features.to(self.device), actions.to(self.device)
+                outputs = self.model(features)
                 
                 # Calculate weighted loss
                 loss_per_sample = criterion(outputs, actions)
@@ -311,14 +323,13 @@ def export_model_for_inference(model, image_size, output_dir='model'):
     model_path = os.path.join(output_dir, 'model.pth')
     torch.save(model.state_dict(), model_path)
     
-    # Save model architecture info
+    # Save model architecture info with updated action columns
     model_info = {
         'input_dim': model.network[0].in_features,
         'hidden_dims': [layer.out_features for layer in model.network if isinstance(layer, nn.Linear)][:-1],
         'output_dim': model.network[-2].out_features,
         'image_size': image_size,
-        'action_columns': ['moving_left', 'moving_right', 'moving_up', 'moving_down',
-                          'attacking', 'jumping', 'dashing', 'focusing', 'dreamnail']
+        'action_columns': ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
     }
     
     info_path = os.path.join(output_dir, 'model_info.json')
@@ -402,12 +413,12 @@ def main():
     
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
     
-    # Create model
-    input_dim = IMAGE_SIZE[0] * IMAGE_SIZE[1]  # Flattened image dimensions
+    # Create model - input dimension now includes image + 4 position features
+    input_dim = IMAGE_SIZE[0] * IMAGE_SIZE[1] + 4  # Flattened image + player_x, player_y, enemy_x, enemy_y
     model = BehavioralCloningNet(
         input_dim=input_dim,
         hidden_dims=[512, 256, 128],
-        output_dim=len(dataset.action_columns)
+        output_dim=len(dataset.action_columns)  # Now 5 actions instead of 9
     )
     
     print(f"Model input dimension: {input_dim}")

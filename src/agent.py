@@ -10,7 +10,7 @@ import pyautogui
 import time
 
 class BehavioralCloningNet(nn.Module):
-    def __init__(self, input_dim, hidden_dims=[512, 256, 128], output_dim=9, dropout_rate=0.3):
+    def __init__(self, input_dim, hidden_dims=[512, 256, 128], output_dim=5, dropout_rate=0.3):
         super(BehavioralCloningNet, self).__init__()
         
         layers = []
@@ -59,25 +59,22 @@ class HollowKnightAI:
         self.action_columns = self.model_info['action_columns']
         self.image_size = tuple(self.model_info['image_size'])  # (width, height)
         
-        # Key mappings
+        # Updated key mappings to match the 5 actions in the CSV
         self.action_keys = {
             'moving_left': 'left',
-            'moving_right': 'right', 
-            'moving_up': 'up',
-            'moving_down': 'down',
-            'attacking': 'z',
-            'jumping': 'x',
-            'dashing': 'c',
-            'focusing': 'a',
-            'dreamnail': 'q'
+            'moving_right': 'right',
+            'attacking': 'x',
+            'jumping': 'z',
+            'dashing': 'c'
         }
         
         # Track currently pressed keys
         self.pressed_keys = set()
         
         print(f"Model loaded - Image size: {self.image_size}, Input dim: {self.model_info['input_dim']}")
+        print(f"Action columns: {self.action_columns}")
     
-    def predict_from_bytes(self, image_bytes, width, height):
+    def predict_from_bytes(self, image_bytes, width, height, player_x=0.5, player_y=0.5, enemy_x=0.0, enemy_y=0.0):
         """Run prediction on image bytes and press keys"""
         try:
             # Convert bytes to numpy array
@@ -93,12 +90,18 @@ class HollowKnightAI:
             # Flatten for neural network
             image_flat = image.flatten()
             
+            # Add position features (normalized to [0, 1])
+            position_features = np.array([player_x, player_y, enemy_x, enemy_y], dtype=np.float32)
+            
+            # Combine image and position features
+            features = np.concatenate([image_flat, position_features])
+            
             # Convert to tensor and add batch dimension
-            image_tensor = torch.FloatTensor(image_flat).unsqueeze(0).to(self.device)
+            features_tensor = torch.FloatTensor(features).unsqueeze(0).to(self.device)
             
             # Predict
             with torch.no_grad():
-                predictions = self.model(image_tensor).cpu().numpy()[0]
+                predictions = self.model(features_tensor).cpu().numpy()[0]
             
             # Log predictions for debugging
             predictions_str = ", ".join([f"{action}:{pred:.3f}" for action, pred in zip(self.action_columns, predictions)])
@@ -167,22 +170,37 @@ def main():
                     break
                 
                 elif line.startswith("PREDICT:"):
-                    # Parse: PREDICT:width:height:base64data
-                    parts = line.split(':', 3)
-                    if len(parts) != 4:
+                    # Parse: PREDICT:width:height:base64data or PREDICT:width:height:player_x:player_y:enemy_x:enemy_y:base64data
+                    parts = line.split(':', 7)
+                    
+                    if len(parts) == 4:
+                        # Old format: PREDICT:width:height:base64data
+                        width = int(parts[1])
+                        height = int(parts[2])
+                        base64_data = parts[3]
+                        player_x = player_y = 0.5  # Default center position
+                        enemy_x = enemy_y = 0.0    # Default no enemy
+                        
+                    elif len(parts) == 8:
+                        # New format: PREDICT:width:height:player_x:player_y:enemy_x:enemy_y:base64data
+                        width = int(parts[1])
+                        height = int(parts[2])
+                        player_x = float(parts[3])
+                        player_y = float(parts[4])
+                        enemy_x = float(parts[5])
+                        enemy_y = float(parts[6])
+                        base64_data = parts[7]
+                        
+                    else:
                         print("ERROR:Invalid format")
                         sys.stdout.flush()
                         continue
-                    
-                    width = int(parts[1])
-                    height = int(parts[2])
-                    base64_data = parts[3]
                     
                     # Decode image
                     image_bytes = base64.b64decode(base64_data)
                     
                     # Get prediction
-                    keys = ai.predict_from_bytes(image_bytes, width, height)
+                    keys = ai.predict_from_bytes(image_bytes, width, height, player_x, player_y, enemy_x, enemy_y)
                     
                     # Send back keys as comma-separated string
                     if keys:
