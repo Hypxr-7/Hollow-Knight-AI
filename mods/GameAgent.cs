@@ -11,8 +11,8 @@ namespace GameAgent
     public class GameAgentMod : Mod
     {
         // Configuration
-        public string pythonScriptPath = @"C:\Users\Abdullah\Documents\GitHub\Hollow-Knight-AI\src\agent.py";
-        public string modelPath = @"C:\Users\Abdullah\Documents\GitHub\Hollow-Knight-AI\modelexported_hollow_knight_model";
+        public string pythonScriptPath = @"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\src\agent.py";
+        public string modelPath = @"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\model";
 
         private bool isAIActive = false;
         private float inferenceTimer = 0f;
@@ -28,7 +28,7 @@ namespace GameAgent
         private string lastKeysPressed = "";
 
         public GameAgentMod() : base("Game Agent") { }
-        public override string GetVersion() => "v3.0";
+        public override string GetVersion() => "T3.0";
 
         public override void Initialize()
         {
@@ -80,7 +80,7 @@ namespace GameAgent
             {
                 ProcessStartInfo startInfo = new ProcessStartInfo()
                 {
-                    FileName = @"C:\Users\Abdullah\Documents\GitHub\Hollow-Knight-AI\.venv\Scripts\python.exe",
+                    FileName = @"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\.venv\Scripts\python.exe",
                     Arguments = $"\"{pythonScriptPath}\" \"{modelPath}\"",
                     UseShellExecute = false,
                     CreateNoWindow = true,

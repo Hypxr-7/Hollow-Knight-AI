@@ -10,7 +10,7 @@ namespace DataCollector
     {
         #region Configuration
         // Configurable save directory
-        public string saveDirectory = @"C:\Users\Abdullah\Downloads\HKData";
+        public string saveDirectory = @"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\HKData";
 
         // Performance settings
         private readonly int targetWidth = 640;
@@ -41,7 +41,7 @@ namespace DataCollector
         #region Constructor and Initialization
         public DataCollectorMod() : base("Data Collector") { }
 
-        public override string GetVersion() => "v3.0";
+        public override string GetVersion() => "T3.0";
 
         public override void Initialize()
         {
