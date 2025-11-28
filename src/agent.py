@@ -255,7 +255,7 @@ class HollowKnightAI:
 def main():
     """Main inference loop"""
     # Default model directory - update as needed
-    model_dir = r"C:\Users\Abdullah\Documents\GitHub\Hollow-Knight-AI\model"  # Or get from command line arguments
+    model_dir = r"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\model"  # Or get from command line arguments
     
     try:
         # Initialize AI

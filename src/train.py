@@ -25,39 +25,33 @@ import torchvision.transforms as transforms
 warnings.filterwarnings('ignore')
 
 class HollowKnightDataset(Dataset):
-    def __init__(self, csv_path, frames_path, transform=None, image_size=(80, 60)):
+    def __init__(self, data_df, transform=None, image_size=(80, 60)):
         """
         Dataset for Hollow Knight behavioral cloning
         
         Args:
-            csv_path: Path to CSV file with actions
-            frames_path: Path to frames directory
+            data_df: Pandas DataFrame with action data and a 'frame_path' column.
             transform: Image transformations
             image_size: Size to resize images to (width, height)
         """
-        self.data = pd.read_csv(csv_path)
-        self.frames_path = frames_path
+        self.data = data_df
         self.transform = transform
         self.image_size = image_size
         
-        # Updated action columns to match new CSV structure
         self.action_columns = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
         
-        # Filter data to only include frames with existing images
         self.valid_indices = self._get_valid_indices()
         self.data = self.data.iloc[self.valid_indices].reset_index(drop=True)
         
         print(f"Dataset loaded: {len(self.data)} samples with valid frames")
         print(f"Image size: {self.image_size} (flattened: {self.image_size[0] * self.image_size[1]} features)")
         
-        # Analyze action distribution
         print("\n=== Action Distribution ===")
         for col in self.action_columns:
             count = self.data[col].sum()
             pct = (count / len(self.data)) * 100
             print(f"{col:15s}: {int(count):5d} frames ({pct:.1f}%)")
         
-        # Analyze enemy presence
         enemy_present = ((self.data['enemy_x'] != 0) | (self.data['enemy_y'] != 0)).sum()
         enemy_pct = (enemy_present / len(self.data)) * 100
         print(f"{'enemy_present':15s}: {int(enemy_present):5d} frames ({enemy_pct:.1f}%)")
@@ -66,8 +60,7 @@ class HollowKnightDataset(Dataset):
         """Get indices of frames that have corresponding images"""
         valid_indices = []
         for idx, row in self.data.iterrows():
-            frame_path = os.path.join(self.frames_path, f"frame_{row['frame_id']:06d}.png")
-            if os.path.exists(frame_path):
+            if os.path.exists(row['frame_path']):
                 valid_indices.append(idx)
         return valid_indices
     
@@ -77,30 +70,24 @@ class HollowKnightDataset(Dataset):
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
         
-        # Load image
-        frame_path = os.path.join(self.frames_path, f"frame_{row['frame_id']:06d}.png")
+        frame_path = row['frame_path']
         image = cv2.imread(frame_path, cv2.IMREAD_GRAYSCALE)
         
-        # Resize image
         image = cv2.resize(image, self.image_size)
-        image = image.astype(np.float32) / 255.0  # Normalize to [0, 1]
+        image = image.astype(np.float32) / 255.0
         
         if self.transform:
             image = self.transform(image)
         
-        # Flatten image for neural network
         image_features = torch.FloatTensor(image).flatten()
         
-        # Add position and enemy information as additional features
-        player_x = torch.FloatTensor([row['x_position'] / 1920.0])  # Normalize assuming 1920 screen width
-        player_y = torch.FloatTensor([row['y_position'] / 1080.0])  # Normalize assuming 1080 screen height
+        player_x = torch.FloatTensor([row['x_position'] / 1920.0])
+        player_y = torch.FloatTensor([row['y_position'] / 1080.0])
         enemy_x = torch.FloatTensor([row['enemy_x'] / 1920.0])
         enemy_y = torch.FloatTensor([row['enemy_y'] / 1080.0])
         
-        # Combine image features with position data
         features = torch.cat([image_features, player_x, player_y, enemy_x, enemy_y])
         
-        # Get actions as binary vector
         actions = torch.FloatTensor([
             float(row[col]) for col in self.action_columns
         ])
@@ -381,7 +368,7 @@ def export_model_for_inference(model, image_size, output_dir='model'):
     model_info = {
         'input_dim': model.network[0].in_features,
         'hidden_dims': [layer.out_features for layer in model.network if isinstance(layer, nn.Linear)][:-1],
-        'output_dim': model.network[-2].out_features,
+        'output_dim': model.network[-1].out_features,
         'image_size': image_size,
         'action_columns': ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
     }
@@ -421,34 +408,50 @@ def main():
     print("Script started!")
     """Main training script"""
     # Configuration
-    DATA_DIR = r"C:\Users\Abdullah\Downloads\HKData"
+    DATA_DIR = r"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\HKData"
     BATCH_SIZE = 64
     EPOCHS = 100
     LEARNING_RATE = 0.001
     IMAGE_SIZE = (80, 60)  # Smaller size for faster training
-    
-    # Find latest session data
+    TRAIN_ON_ALL_DATA = True # Set to True to train on all data in HKData
+
+    # --- Data Loading ---
     csv_files = [f for f in os.listdir(DATA_DIR) if f.startswith('hk_actions_') and f.endswith('.csv')]
     if not csv_files:
-        print("No CSV files found!")
+        print(f"No CSV files found in {DATA_DIR}")
         return
-    
-    latest_csv = max(csv_files)
-    session_id = latest_csv.replace('hk_actions_', '').replace('.csv', '')
-    frames_dir = os.path.join(DATA_DIR, f'frames_{session_id}')
-    
-    print(f"Training on session: {session_id}")
-    print(f"CSV: {latest_csv}")
-    print(f"Frames: {frames_dir}")
-    
-    if not os.path.exists(frames_dir):
-        print(f"Frames directory not found: {frames_dir}")
+
+    data_to_load = []
+    if TRAIN_ON_ALL_DATA:
+        print("Loading all data sessions...")
+        data_to_load = csv_files
+    else:
+        print("Loading latest data session...")
+        data_to_load.append(max(csv_files))
+
+    all_dfs = []
+    for csv_file in data_to_load:
+        session_id = csv_file.replace('hk_actions_', '').replace('.csv', '')
+        frames_dir = os.path.join(DATA_DIR, f'frames_{session_id}')
+        csv_path = os.path.join(DATA_DIR, csv_file)
+
+        if os.path.exists(frames_dir):
+            print(f"Processing session: {session_id}")
+            df = pd.read_csv(csv_path)
+            df['frame_path'] = df['frame_id'].apply(lambda x: os.path.join(frames_dir, f"frame_{x:06d}.png"))
+            all_dfs.append(df)
+        else:
+            print(f"Warning: Frames directory not found for session {session_id}, skipping.")
+
+    if not all_dfs:
+        print("No data could be loaded.")
         return
-    
+        
+    master_df = pd.concat(all_dfs, ignore_index=True)
+
     # Create dataset
     dataset = HollowKnightDataset(
-        csv_path=os.path.join(DATA_DIR, latest_csv),
-        frames_path=frames_dir,
+        data_df=master_df,
         image_size=IMAGE_SIZE
     )
     
