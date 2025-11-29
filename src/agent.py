@@ -1,329 +1,181 @@
 import torch
-import torch.nn as nn
 import numpy as np
 import json
 import cv2
 import sys
 import base64
-from pathlib import Path
+import os
 import pyautogui
 import time
-import threading
 
-class BehavioralCloningNet(nn.Module):
-    def __init__(self, input_dim, hidden_dims=[512, 256, 128], output_dim=5, dropout_rate=0.3):
-        super(BehavioralCloningNet, self).__init__()
-        
-        layers = []
-        prev_dim = input_dim
-        
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.ReLU(),
-                nn.BatchNorm1d(hidden_dim),
-                nn.Dropout(dropout_rate)
-            ])
-            prev_dim = hidden_dim
-        
-        # Remove the sigmoid - model outputs raw logits
-        layers.append(nn.Linear(prev_dim, output_dim))
-        
-        self.network = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        return self.network(x)
+# Import the correct, up-to-date classes and functions from train.py
+from train import BehavioralCloningNet, load_model_for_inference
 
-class HollowKnightAI:
-    def __init__(self, model_dir):
+class EnsembleAgent:
+    """
+    An agent that uses an ensemble of CNN models to make predictions.
+    """
+    def __init__(self, model_base_dir='model'):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.models_with_info = []
+
+        print("Loading ensemble models...", file=sys.stderr)
         
-        # Load model info
-        model_info_path = Path(model_dir) / 'model_info.json'
-        with open(model_info_path, 'r') as f:
-            self.model_info = json.load(f)
+        ensemble_dirs = sorted([
+            os.path.join(model_base_dir, d) for d in os.listdir(model_base_dir) 
+            if d.startswith('ensemble_') and os.path.isdir(os.path.join(model_base_dir, d))
+        ])
         
-        # Load model
-        self.model = BehavioralCloningNet(
-            input_dim=self.model_info['input_dim'],
-            hidden_dims=self.model_info['hidden_dims'],
-            output_dim=self.model_info['output_dim'],
-            dropout_rate=0.0  # No dropout during inference
-        )
+        if not ensemble_dirs:
+            raise FileNotFoundError(f"No 'ensemble_*' directories found in '{model_base_dir}'")
+
+        print(f"Found {len(ensemble_dirs)} models in the ensemble.", file=sys.stderr)
+
+        for model_dir in ensemble_dirs:
+            print(f"Loading model from {model_dir}...", file=sys.stderr)
+            model, info = load_model_for_inference(model_dir)
+            model.to(self.device)
+            self.models_with_info.append((model, info))
         
-        # Load model weights - updated to match training export
-        weights_path = Path(model_dir) / 'model.pth'
-        self.model.load_state_dict(torch.load(weights_path, map_location=self.device))
-        self.model.to(self.device)
-        self.model.eval()
-        
-        self.action_columns = self.model_info['action_columns']
-        self.image_size = tuple(self.model_info['image_size'])  # (width, height)
-        
-        # Updated key mappings to match the 5 actions in the CSV
+        self.action_columns = self.models_with_info[0][1]['action_columns']
+
         self.action_keys = {
-            'moving_left': 'left',
-            'moving_right': 'right',
-            'attacking': 'x',
-            'jumping': 'z',
-            'dashing': 'c'
+            'moving_left': 'left', 'moving_right': 'right',
+            'attacking': 'x', 'jumping': 'z', 'dashing': 'c'
         }
-        
-        # Track currently pressed keys
         self.pressed_keys = set()
-        
-        # Jump timing control
-        self.jump_start_time = None
-        self.jump_duration = 2.0  # 2 seconds
-        
-        print(f"Model loaded - Image size: {self.image_size}, Input dim: {self.model_info['input_dim']}")
-        print(f"Action columns: {self.action_columns}")
-    
-    def _handle_jump_timing(self, should_jump):
-        """Handle jump key timing - keep pressed for 2 seconds once triggered"""
-        current_time = time.time()
-        jump_key = self.action_keys['jumping']
-        
-        if should_jump and self.jump_start_time is None:
-            # Start jump
-            self.jump_start_time = current_time
-            if jump_key not in self.pressed_keys:
-                pyautogui.keyDown(jump_key)
-                self.pressed_keys.add(jump_key)
-        
-        # Check if jump duration has elapsed
-        if self.jump_start_time is not None:
-            if current_time - self.jump_start_time >= self.jump_duration:
-                # End jump
-                if jump_key in self.pressed_keys:
-                    pyautogui.keyUp(jump_key)
-                    self.pressed_keys.discard(jump_key)
-                self.jump_start_time = None
-                return False  # Jump is no longer active
-            else:
-                return True  # Jump is still active
-        
-        return False
-    
-
-
-
+        print(f"Ensemble loaded with {len(self.models_with_info)} models.")
 
     def predict_from_bytes(self, image_bytes, width, height, player_x=0.5, player_y=0.5, enemy_x=0.0, enemy_y=0.0):
-        """Run prediction on image bytes and press keys"""
         try:
-            # Convert bytes to numpy array
-            image_np = np.frombuffer(image_bytes, dtype=np.uint8)
-            image_np = image_np.reshape((height, width))
-            
-            # Resize to match training image size (width, height)
-            image_resized = cv2.resize(image_np, self.image_size)
-            
-            # Normalize to [0, 1]
-            image = image_resized.astype(np.float32) / 255.0
-            
-            # Flatten for neural network
-            image_flat = image.flatten()
-            
-            # Add position features (normalized to [0, 1])
-            position_features = np.array([player_x, player_y, enemy_x, enemy_y], dtype=np.float32)
-            
-            # Combine image and position features
-            features = np.concatenate([image_flat, position_features])
-            
-            # Convert to tensor and add batch dimension
-            features_tensor = torch.FloatTensor(features).unsqueeze(0).to(self.device)
-            
-            # Predict
+            # --- Preprocessing for CNN ---
+            image_np = np.frombuffer(image_bytes, dtype=np.uint8).reshape((height, width))
+
+            other_features = torch.FloatTensor([
+                player_x, player_y, enemy_x, enemy_y
+            ]).unsqueeze(0).to(self.device)
+
+            # --- Ensemble Prediction ---
+            all_logits = []
             with torch.no_grad():
-                logits = self.model(features_tensor)
-                # Apply sigmoid to convert logits to probabilities
-                predictions = torch.sigmoid(logits).cpu().numpy()[0]
-            
-            # Enhanced debugging
-            predictions_str = ", ".join([f"{action}:{pred:.3f}" for action, pred in zip(self.action_columns, predictions)])
-            sys.stderr.write(f"Predictions: {predictions_str}\n")
-            
-            # Handle jump timing first
-            should_jump = predictions[self.action_columns.index('jumping')] > 0.3 if 'jumping' in self.action_columns else False  # Lower jump threshold
-            jump_is_active = self._handle_jump_timing(should_jump)
-            
-            # Use lower, action-specific thresholds based on your data distribution
-            thresholds = {
-                'moving_left': 0.25,    # 20.6% in data, so lower threshold
-                'moving_right': 0.25,   # 22.1% in data, so lower threshold
-                'attacking': 0.35,      # 28.1% in data, higher threshold
-                'jumping': 0.3,         # 3.1% in data, much lower threshold
-                'dashing': 0.1          # 0% in data, very low threshold to encourage
-            }
-            
-            # Get keys to press
-            keys_to_press = set()
-            
-            for i, (action, pred) in enumerate(zip(self.action_columns, predictions)):
-                threshold = thresholds.get(action, 0.5)
-                
-                if action == 'jumping':
-                    if jump_is_active:
-                        keys_to_press.add(self.action_keys[action])
-                        sys.stderr.write(f"Jump active (timing)\n")
-                elif pred > threshold and action in self.action_keys:
-                    keys_to_press.add(self.action_keys[action])
-                    sys.stderr.write(f"Action triggered: {action} ({pred:.3f} > {threshold:.3f})\n")
-            
-            # Handle movement conflicts - your data shows these rarely happen together
-            if 'left' in keys_to_press and 'right' in keys_to_press:
-                left_pred = predictions[self.action_columns.index('moving_left')]
-                right_pred = predictions[self.action_columns.index('moving_right')]
-                
-                # Keep the stronger prediction
-                if left_pred > right_pred:
-                    keys_to_press.discard('right')
-                    sys.stderr.write(f"Conflict resolved: keeping left ({left_pred:.3f}) over right ({right_pred:.3f})\n")
-                else:
-                    keys_to_press.discard('left')
-                    sys.stderr.write(f"Conflict resolved: keeping right ({right_pred:.3f}) over left ({left_pred:.3f})\n")
-            
-            # Anti-spam: only change if predictions are confident enough or significantly different
-            if hasattr(self, 'last_predictions'):
-                # Check if any action crossed its threshold significantly
-                significant_change = False
-                for i, (action, pred) in enumerate(zip(self.action_columns, predictions)):
-                    last_pred = self.last_predictions[i]
-                    threshold = thresholds.get(action, 0.5)
+                for model, info in self.models_with_info:
+                    # --- Preprocessing for each model ---
+                    image_shape = info['image_shape']
+                    image_size = (image_shape[2], image_shape[1]) # W, H
+
+                    image_resized = cv2.resize(image_np, image_size, interpolation=cv2.INTER_AREA)
                     
-                    # Check for threshold crossing
-                    if (pred > threshold and last_pred <= threshold) or (pred <= threshold and last_pred > threshold):
-                        significant_change = True
-                        sys.stderr.write(f"Significant change in {action}: {last_pred:.3f} -> {pred:.3f} (threshold: {threshold:.3f})\n")
-                        break
-                
-                if not significant_change:
-                    # Keep current state if no significant changes
-                    sys.stderr.write("No significant prediction changes, maintaining current state\n")
-                    return list(self.pressed_keys)
+                    image_tensor = torch.from_numpy(image_resized).float().to(self.device) / 255.0
+                    image_tensor = image_tensor.unsqueeze(0).unsqueeze(0)
+
+                    logits = model(image_tensor, other_features)
+                    all_logits.append(logits)
             
-            self.last_predictions = predictions.copy()
+            avg_logits = torch.stack(all_logits).mean(dim=0)
+            predictions = torch.sigmoid(avg_logits).cpu().numpy()[0]
             
-            # Release keys that should no longer be pressed (excluding jump)
-            keys_to_release = self.pressed_keys - keys_to_press
-            jump_key = self.action_keys['jumping']
-            keys_to_release.discard(jump_key)  # Don't auto-release jump key
-            
-            for key in keys_to_release:
-                pyautogui.keyUp(key)
-                sys.stderr.write(f"Released key: {key}\n")
-            
-            # Press new keys (excluding jump which is handled separately)
-            keys_to_press_new = keys_to_press - self.pressed_keys
-            if jump_key in keys_to_press_new:
-                keys_to_press_new.discard(jump_key)  # Jump is handled separately
-            
-            for key in keys_to_press_new:
-                pyautogui.keyDown(key)
-                sys.stderr.write(f"Pressed key: {key}\n")
-            
-            # Update pressed keys
-            self.pressed_keys = keys_to_press
-            
-            # Log final action
-            if keys_to_press:
-                actions_str = ", ".join([action for action, key in self.action_keys.items() if key in keys_to_press])
-                sys.stderr.write(f"Final actions: {actions_str}\n")
-            else:
-                sys.stderr.write("Final actions: No actions (idle)\n")
-            
-            return list(keys_to_press)
+            # --- Action Logic ---
+            self.execute_actions(predictions)
             
         except Exception as e:
-            print(f"ERROR:{e}", file=sys.stderr)
-            sys.stderr.flush()
-            return []
+            print(f"ERROR in prediction: {e}", file=sys.stderr)
+            self.release_all_keys()
 
+    def execute_actions(self, predictions):
+        """Determine which keys to press or release based on predictions."""
+        # Actions that should be single presses, not holds (e.g., attacking, dashing)
+        press_action_names = {'attacking', 'dashing'}
+
+        desired_holds = set()
+        
+        thresholds = {
+            'moving_left': 0.3, 'moving_right': 0.3,
+            'attacking': 0.4, 'jumping': 0.35, 'dashing': 0.3
+        }
+
+        # Determine press and hold actions from predictions
+        for i, action in enumerate(self.action_columns):
+            if predictions[i] > thresholds.get(action, 0.5):
+                action_key = self.action_keys[action]
+                if action in press_action_names:
+                    # For actions like attacking, press and release immediately.
+                    # This prevents the key from being held down across multiple frames.
+                    pyautogui.press(action_key) 
+                else:
+                    # For actions like moving or jumping, add to the set of keys to be held down.
+                    desired_holds.add(action_key)
+
+        # Handle mutual exclusion for movement
+        if 'left' in desired_holds and 'right' in desired_holds:
+            if predictions[self.action_columns.index('moving_left')] > predictions[self.action_columns.index('moving_right')]:
+                desired_holds.discard('right')
+            else:
+                desired_holds.discard('left')
+        
+        # Update held keys based on the desired holds for this frame
+        # First, release keys that are no longer desired to be held.
+        keys_to_release = self.pressed_keys - desired_holds
+        for key in keys_to_release:
+            pyautogui.keyUp(key)
+        
+        # Then, press down new keys that should now be held.
+        keys_to_press_new = desired_holds - self.pressed_keys
+        for key in keys_to_press_new:
+            pyautogui.keyDown(key)
+            
+        # Update the set of currently held keys for the next frame.
+        # This set only contains keys for 'hold' actions.
+        self.pressed_keys = desired_holds
 
     def release_all_keys(self):
-        """Release all currently pressed keys"""
-        for key in self.pressed_keys:
-            try:
-                pyautogui.keyUp(key)
-            except:
-                pass
+        for key in list(self.pressed_keys):
+            pyautogui.keyUp(key)
         self.pressed_keys.clear()
-        self.jump_start_time = None
-
 
 def main():
-    """Main inference loop"""
-    # Default model directory - update as needed
-    model_dir = r"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\model"  # Or get from command line arguments
-    
+    """Main inference loop for the ensemble agent."""
+    if len(sys.argv) > 1:
+        model_base_dir = sys.argv[1]
+    else:
+        model_base_dir = 'model'
     try:
-        # Initialize AI
-        ai = HollowKnightAI(model_dir)
+        agent = EnsembleAgent(model_base_dir)
         print("READY")
         sys.stdout.flush()
         
-        # Command loop
         while True:
-            try:
-                line = sys.stdin.readline()
-                if not line:
-                    break
-                    
-                line = line.strip()
-                
-                if line == "QUIT":
-                    ai.release_all_keys()  # Clean up before quitting
-                    print("QUIT_OK")
-                    sys.stdout.flush()
-                    break
-                
-                elif line.startswith("PREDICT:"):
-                    # Parse: PREDICT:width:height:base64data or PREDICT:width:height:player_x:player_y:enemy_x:enemy_y:base64data
-                    parts = line.split(':', 7)
-                    
-                    if len(parts) == 4:
-                        # Old format: PREDICT:width:height:base64data
-                        width = int(parts[1])
-                        height = int(parts[2])
-                        base64_data = parts[3]
-                        player_x = player_y = 0.5  # Default center position
-                        enemy_x = enemy_y = 0.0    # Default no enemy
-                        
-                    elif len(parts) == 8:
-                        # New format: PREDICT:width:height:player_x:player_y:enemy_x:enemy_y:base64data
-                        width = int(parts[1])
-                        height = int(parts[2])
-                        player_x = float(parts[3])
-                        player_y = float(parts[4])
-                        enemy_x = float(parts[5])
-                        enemy_y = float(parts[6])
-                        base64_data = parts[7]
-                        
-                    else:
-                        print("ERROR:Invalid format")
-                        sys.stdout.flush()
-                        continue
-                    
-                    # Decode image
-                    image_bytes = base64.b64decode(base64_data)
-                    
-                    # Get prediction
-                    keys = ai.predict_from_bytes(image_bytes, width, height, player_x, player_y, enemy_x, enemy_y)
-                    
-                    # Send back keys as comma-separated string
-                    if keys:
-                        print(f"KEYS:{','.join(keys)}")
-                    else:
-                        print("KEYS:")
-                    sys.stdout.flush()
-                    
-            except Exception as e:
-                print(f"ERROR:{e}")
+            line = sys.stdin.readline()
+            if not line: break
+            line = line.strip()
+
+            if line == "QUIT":
+                agent.release_all_keys()
+                print("QUIT_OK")
                 sys.stdout.flush()
+                break
+            
+            elif line.startswith("PREDICT:"):
+                try:
+                    # The C# mod sends: PREDICT:width:height:base64data
+                    parts = line.split(':', 3)
+                    if len(parts) == 4:
+                        width, height = int(parts[1]), int(parts[2])
+                        image_bytes = base64.b64decode(parts[3])
+                        
+                        # Call predict with default coords, as they are not sent from the mod
+                        agent.predict_from_bytes(image_bytes, width, height)
+                        print("KEYS:") # Acknowledge prediction
+                        sys.stdout.flush()
+                    else:
+                        raise ValueError(f"Expected 4 parts but got {len(parts)}")
+
+                except (ValueError, IndexError) as e:
+                    print(f"ERROR:Invalid PREDICT format - {e}", file=sys.stderr)
+                    sys.stdout.flush()
+                    continue
                 
     except Exception as e:
-        print(f"FATAL:{e}")
+        print(f"FATAL:{e}", file=sys.stderr)
         sys.stderr.flush()
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 # Standard library imports
 import os
 import json
+import random
 import warnings
 
 # Third-party imports
@@ -21,48 +22,53 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 
+import torch.nn.functional as F
+
 # Warnings configuration
 warnings.filterwarnings('ignore')
 
 class HollowKnightDataset(Dataset):
+    """
+    Dataset for Hollow Knight behavioral cloning.
+    Prepares image and positional data for the CNN model.
+    """
     def __init__(self, data_df, transform=None, image_size=(80, 60)):
-        """
-        Dataset for Hollow Knight behavioral cloning
-        
-        Args:
-            data_df: Pandas DataFrame with action data and a 'frame_path' column.
-            transform: Image transformations
-            image_size: Size to resize images to (width, height)
-        """
-        self.data = data_df
+        self.data = data_df.copy() # Use a copy to avoid SettingWithCopyWarning
         self.transform = transform
-        self.image_size = image_size
-        
         self.action_columns = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
         
-        self.valid_indices = self._get_valid_indices()
-        self.data = self.data.iloc[self.valid_indices].reset_index(drop=True)
+        # Directly filter the dataframe to only include rows with valid frame paths
+        # This is much safer than collecting and using indices after a train/test split.
+        self.data = self.data[self.data['frame_path'].apply(os.path.exists)].reset_index(drop=True)
+
+        self.image_size = image_size
         
+        if not self.image_size:
+            self.image_size = self._get_original_image_size()
+
         print(f"Dataset loaded: {len(self.data)} samples with valid frames")
-        print(f"Image size: {self.image_size} (flattened: {self.image_size[0] * self.image_size[1]} features)")
+        if self.image_size:
+            print(f"Image size: {self.image_size}")
+        else:
+            print("Image size: Not determined (no valid frames found).")
         
         print("\n=== Action Distribution ===")
         for col in self.action_columns:
             count = self.data[col].sum()
-            pct = (count / len(self.data)) * 100
+            pct = (count / len(self.data)) * 100 if len(self.data) > 0 else 0
             print(f"{col:15s}: {int(count):5d} frames ({pct:.1f}%)")
         
         enemy_present = ((self.data['enemy_x'] != 0) | (self.data['enemy_y'] != 0)).sum()
-        enemy_pct = (enemy_present / len(self.data)) * 100
+        enemy_pct = (enemy_present / len(self.data)) * 100 if len(self.data) > 0 else 0
         print(f"{'enemy_present':15s}: {int(enemy_present):5d} frames ({enemy_pct:.1f}%)")
     
-    def _get_valid_indices(self):
-        """Get indices of frames that have corresponding images"""
-        valid_indices = []
-        for idx, row in self.data.iterrows():
-            if os.path.exists(row['frame_path']):
-                valid_indices.append(idx)
-        return valid_indices
+    def _get_original_image_size(self):
+        if len(self.data) > 0:
+            first_frame_path = self.data['frame_path'].iloc[0]
+            if os.path.exists(first_frame_path):
+                with Image.open(first_frame_path) as img:
+                    return img.size # (width, height)
+        return None
     
     def __len__(self):
         return len(self.data)
@@ -70,66 +76,94 @@ class HollowKnightDataset(Dataset):
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
         
-        frame_path = row['frame_path']
-        image = cv2.imread(frame_path, cv2.IMREAD_GRAYSCALE)
-        
-        image = cv2.resize(image, self.image_size)
-        image = image.astype(np.float32) / 255.0
-        
-        if self.transform:
-            image = self.transform(image)
-        
-        image_features = torch.FloatTensor(image).flatten()
-        
-        player_x = torch.FloatTensor([row['x_position'] / 1920.0])
-        player_y = torch.FloatTensor([row['y_position'] / 1080.0])
-        enemy_x = torch.FloatTensor([row['enemy_x'] / 1920.0])
-        enemy_y = torch.FloatTensor([row['enemy_y'] / 1080.0])
-        
-        features = torch.cat([image_features, player_x, player_y, enemy_x, enemy_y])
-        
-        actions = torch.FloatTensor([
-            float(row[col]) for col in self.action_columns
+        # Load image, ensure it's grayscale, and resize
+        with Image.open(row['frame_path']).convert('L') as img:
+            if self.image_size:
+                img = img.resize(self.image_size, Image.Resampling.LANCZOS)
+            
+            if self.transform:
+                img = self.transform(img)
+            else:
+                # Default transform to tensor and normalize
+                img = transforms.ToTensor()(img)
+
+        # Other features (player and enemy positions)
+        other_features = torch.FloatTensor([
+            row['x_position'] / 1920.0,
+            row['y_position'] / 1080.0,
+            row['enemy_x'] / 1920.0,
+            row['enemy_y'] / 1080.0
         ])
         
-        return features, actions
+        actions = torch.FloatTensor([float(row[col]) for col in self.action_columns])
+        
+        # Return image, other features, and actions separately
+        return img, other_features, actions
 
 
 class BehavioralCloningNet(nn.Module):
-    def __init__(self, input_dim, hidden_dims=[512, 256, 128], output_dim=5, dropout_rate=0.3):
-        """
-        Neural network for multi-label behavioral cloning
-        
-        Args:
-            input_dim: Input dimension (image features + position data)
-            hidden_dims: Hidden layer dimensions
-            output_dim: Output dimension (number of actions)
-            dropout_rate: Dropout rate for regularization
-        """
+    """
+    CNN for multi-label behavioral cloning.
+    Processes image data with convolutional layers and combines it with positional data.
+    """
+    def __init__(self, image_shape=(1, 60, 80), other_features_dim=4, num_actions=5, dropout_rate=0.5):
         super(BehavioralCloningNet, self).__init__()
         
-        layers = []
-        prev_dim = input_dim
+        # Convolutional layers for image processing
+        self.conv1 = nn.Conv2d(in_channels=image_shape[0], out_channels=32, kernel_size=5, padding=2)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2) # Reduces dimensions by half
+
+        # Calculate flattened size after conv and pooling layers
+        self._conv_out_shape = self._get_conv_out_shape(image_shape)
         
-        # Hidden layers
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.ReLU(),
-                nn.BatchNorm1d(hidden_dim),
-                nn.Dropout(dropout_rate)
-            ])
-            prev_dim = hidden_dim
+        # Fully connected layers
+        self.fc1 = nn.Linear(self._conv_out_shape + other_features_dim, 256)
+        self.bn3 = nn.BatchNorm1d(256)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc2 = nn.Linear(256, num_actions)
+
+    def _get_conv_out_shape(self, shape):
+        # Create a dummy tensor and pass it through the conv layers to find output shape
+        with torch.no_grad():
+            dummy_tensor = torch.zeros(1, *shape) # (N, C, H, W)
+            x = self.pool(F.relu(self.bn1(self.conv1(dummy_tensor))))
+            x = self.pool(F.relu(self.bn2(self.conv2(x))))
+            return int(np.prod(x.shape))
+
+    def forward(self, image, other_features):
+        # Process image through CNN
+        x = self.pool(F.relu(self.bn1(self.conv1(image))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
         
-        # Output layer - NO SIGMOID (BCEWithLogitsLoss handles it)
-        layers.append(nn.Linear(prev_dim, output_dim))
+        # Flatten the output of the CNN
+        x = x.view(x.size(0), -1)
         
-        self.network = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        return self.network(x)
+        # Concatenate with other features
+        combined = torch.cat([x, other_features], dim=1)
+        
+        # Pass through fully connected layers
+        combined = F.relu(self.bn3(self.fc1(combined)))
+        combined = self.dropout(combined)
+        output = self.fc2(combined) # No sigmoid, handled by BCEWithLogitsLoss
+        
+        return output
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, reduction='mean', pos_weight=None):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none', pos_weight=pos_weight)
+
+    def forward(self, inputs, targets):
+        logpt = -self.bce_loss(inputs, targets)
+        pt = torch.exp(logpt)
+        focal_loss = -((1 - pt) ** self.gamma) * logpt
+        return focal_loss.mean() if self.reduction == 'mean' else focal_loss.sum()
 
 
 class BehavioralCloningTrainer:
@@ -137,195 +171,122 @@ class BehavioralCloningTrainer:
         self.model = model
         self.device = device
         self.model.to(device)
-        
-        # Training history
+        self.reset_history()
+
+    def reset_history(self):
         self.train_losses = []
         self.val_losses = []
         self.val_accuracies = []
         self.per_action_accuracies = []
     
     def save_checkpoint(self, filepath):
-        """Save model checkpoint"""
         torch.save(self.model.state_dict(), filepath)
     
     def load_checkpoint(self, filepath):
-        """Load model checkpoint"""
         self.model.load_state_dict(torch.load(filepath, map_location=self.device))
     
     def validate(self, val_loader, criterion):
-        """Validate the model with multi-label metrics"""
         self.model.eval()
-        val_loss = 0
-        exact_matches = 0
-        total_samples = 0
-        
-        # Per-action accuracy tracking
-        action_correct = torch.zeros(5).to(self.device)
-        action_total = torch.zeros(5).to(self.device)
+        val_loss, exact_matches, total_samples = 0, 0, 0
+        action_correct = torch.zeros(5, device=self.device)
+        action_total = torch.zeros(5, device=self.device)
         
         with torch.no_grad():
-            for features, actions in val_loader:
-                features, actions = features.to(self.device), actions.to(self.device)
-                outputs = self.model(features)
+            for images, other_features, actions in val_loader:
+                images, other_features, actions = images.to(self.device), other_features.to(self.device), actions.to(self.device)
+                outputs = self.model(images, other_features)
                 
-                # Calculate loss
                 loss = criterion(outputs, actions)
                 val_loss += loss.item()
                 
-                # Apply sigmoid to get probabilities
-                probabilities = torch.sigmoid(outputs)
-                predicted = (probabilities > 0.5).float()
-                
-                # Exact match accuracy (all actions must match)
-                exact_match = (predicted == actions).all(dim=1).float()
-                exact_matches += exact_match.sum().item()
+                predicted = (torch.sigmoid(outputs) > 0.5).float()
+                exact_matches += (predicted == actions).all(dim=1).sum().item()
                 total_samples += actions.size(0)
                 
-                # Per-action accuracy
-                for i in range(5):  # 5 actions
+                for i in range(5):
                     action_correct[i] += (predicted[:, i] == actions[:, i]).sum().item()
                     action_total[i] += actions.size(0)
         
         avg_val_loss = val_loss / len(val_loader)
         exact_match_accuracy = exact_matches / total_samples
+        per_action_acc = [corr.item() / total.item() if total.item() > 0 else 0 for corr, total in zip(action_correct, action_total)]
         
-        # Calculate per-action accuracies
-        per_action_accuracies = []
-        for i in range(5):
-            acc = action_correct[i].item() / action_total[i].item()
-            per_action_accuracies.append(acc)
-        
-        return avg_val_loss, exact_match_accuracy, per_action_accuracies
+        return avg_val_loss, exact_match_accuracy, per_action_acc
     
-    def plot_training_history(self):
-        """Plot training metrics"""
-        if not self.train_losses:
-            print("No training history to plot")
-            return
-        
+    def plot_training_history(self, save_path='training_history.png'):
+        if not self.train_losses: return
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        action_names = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
         
-        # Training and validation loss
         axes[0, 0].plot(self.train_losses, label='Training Loss')
         axes[0, 0].plot(self.val_losses, label='Validation Loss')
-        axes[0, 0].set_title('Loss Over Time')
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].legend()
+        axes[0, 0].set_title('Loss')
         axes[0, 0].grid(True)
+        axes[0, 0].legend()
         
-        # Exact match accuracy
         axes[0, 1].plot(self.val_accuracies, label='Exact Match Accuracy', color='green')
-        axes[0, 1].set_title('Exact Match Accuracy Over Time')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Accuracy')
-        axes[0, 1].legend()
+        axes[0, 1].set_title('Exact Match Accuracy')
         axes[0, 1].grid(True)
-        
-        # Per-action accuracy over time
-        if self.per_action_accuracies:
-            action_names = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
-            per_action_array = np.array(self.per_action_accuracies)
-            
-            for i, action in enumerate(action_names):
-                axes[1, 0].plot(per_action_array[:, i], label=action)
-            
-            axes[1, 0].set_title('Per-Action Accuracy Over Time')
-            axes[1, 0].set_xlabel('Epoch')
-            axes[1, 0].set_ylabel('Accuracy')
-            axes[1, 0].legend()
-            axes[1, 0].grid(True)
-        
-        # Final per-action accuracy bar chart
-        if self.per_action_accuracies:
-            final_accuracies = self.per_action_accuracies[-1]
-            action_names = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
-            
-            bars = axes[1, 1].bar(action_names, final_accuracies)
-            axes[1, 1].set_title('Final Per-Action Accuracy')
-            axes[1, 1].set_xlabel('Action')
-            axes[1, 1].set_ylabel('Accuracy')
-            axes[1, 1].set_ylim(0, 1)
-            
-            # Add value labels on bars
-            for bar, acc in zip(bars, final_accuracies):
-                axes[1, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, 
-                               f'{acc:.3f}', ha='center', va='bottom')
-            
-            # Rotate x-labels for better readability
-            axes[1, 1].tick_params(axis='x', rotation=45)
+        axes[0, 1].legend()
+
+        per_action_array = np.array(self.per_action_accuracies)
+        for i, action in enumerate(action_names):
+            axes[1, 0].plot(per_action_array[:, i], label=action)
+        axes[1, 0].set_title('Per-Action Accuracy')
+        axes[1, 0].grid(True)
+        axes[1, 0].legend()
+
+        final_accuracies = self.per_action_accuracies[-1]
+        bars = axes[1, 1].bar(action_names, final_accuracies)
+        axes[1, 1].set_title('Final Per-Action Accuracy')
+        axes[1, 1].set_ylim(0, 1)
+        axes[1, 1].tick_params(axis='x', rotation=45)
+        for bar, acc in zip(bars, final_accuracies):
+            axes[1, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, f'{acc:.3f}', ha='center', va='bottom')
         
         plt.tight_layout()
-        plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
-        plt.show()
-        print("Training history plot saved as 'training_history.png'")
+        plt.savefig(save_path, dpi=300)
+        plt.close(fig)
+        print(f"Training history plot saved as '{save_path}'")
 
-    def train(self, train_loader, val_loader, epochs=50, learning_rate=0.001):
-        """Train the behavioral cloning model for multi-label classification"""
+    def train(self, train_loader, val_loader, epochs, learning_rate, weight_decay, loss_type):
+        self.reset_history()
         
-        # Calculate class weights for each action independently
-        print("\n=== Calculating per-action class weights ===")
         pos_weights = []
+        for i, col in enumerate(train_loader.dataset.action_columns):
+            data_source = train_loader.dataset.data
+            pos = data_source[col].sum()
+            neg = len(data_source) - pos
+            pos_weights.append(neg / pos if pos > 0 else 1.0)
         
-        for i, col in enumerate(['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']):
-            positive_samples = train_loader.dataset.dataset.data[col].sum()
-            total_samples = len(train_loader.dataset.dataset.data)
-            negative_samples = total_samples - positive_samples
-            
-            if positive_samples > 0:
-                # For multi-label: weight = negative_samples / positive_samples
-                weight = negative_samples / positive_samples
-                pos_weights.append(weight)
-                print(f"{col:15s}: pos={positive_samples:5d}, neg={negative_samples:5d}, weight={weight:.2f}")
-            else:
-                pos_weights.append(1.0)
-                print(f"{col:15s}: pos={positive_samples:5d}, neg={negative_samples:5d}, weight=1.00 (no positives)")
-        
-        pos_weights = torch.FloatTensor(pos_weights).to(self.device)
-        
-        # Use BCEWithLogitsLoss with pos_weight for multi-label classification
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
-        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        criterion = FocalLoss(pos_weight=torch.FloatTensor(pos_weights).to(self.device)) if loss_type == 'focal' else nn.BCEWithLogitsLoss(pos_weight=torch.FloatTensor(pos_weights).to(self.device))
+        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
         
-        print(f"\nTraining on {self.device}")
+        print(f"\nTraining on {self.device} with {loss_type.upper()} loss...")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
         best_val_loss = float('inf')
-        patience_counter = 0
-        patience = 15
-        
+        patience_counter, patience = 0, 15
+
         for epoch in range(epochs):
-            # Training
             self.model.train()
             train_loss = 0
             
-            for batch_idx, (features, actions) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")):
-                features, actions = features.to(self.device), actions.to(self.device)
-                
+            for images, other_features, actions in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+                images, other_features, actions = images.to(self.device), other_features.to(self.device), actions.to(self.device)
                 optimizer.zero_grad()
-                outputs = self.model(features)
-                
-                # BCEWithLogitsLoss expects raw logits, not sigmoid outputs
+                outputs = self.model(images, other_features)
                 loss = criterion(outputs, actions)
-                
                 loss.backward()
-                
-                # Gradient clipping to prevent exploding gradients
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
                 train_loss += loss.item()
             
             avg_train_loss = train_loss / len(train_loader)
-            
-            # Validation
             val_loss, val_accuracy, per_action_acc = self.validate(val_loader, criterion)
-            
-            # Learning rate scheduling
             scheduler.step(val_loss)
             
-            # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
@@ -333,93 +294,77 @@ class BehavioralCloningTrainer:
             else:
                 patience_counter += 1
             
-            # Store history
             self.train_losses.append(avg_train_loss)
             self.val_losses.append(val_loss)
             self.val_accuracies.append(val_accuracy)
             self.per_action_accuracies.append(per_action_acc)
             
-            # Enhanced logging
             per_action_str = ", ".join([f"{acc:.2f}" for acc in per_action_acc])
-            print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, "
-                  f"Val Loss: {val_loss:.4f}, Exact Match: {val_accuracy:.3f}")
-            print(f"    Per-action accuracy: [{per_action_str}]")
+            print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}, Exact Match: {val_accuracy:.3f}, Actions: [{per_action_str}]")
             
-            # Early stopping
             if patience_counter >= patience:
-                print(f"Early stopping after {epoch+1} epochs")
+                print(f"Early stopping after {epoch+1} epochs.")
                 break
         
-        # Load best model
         self.load_checkpoint('best_model.pth')
         print("Training completed!")
+        return best_val_loss, self.per_action_accuracies[-1] if self.per_action_accuracies else [0]*5
 
 def export_model_for_inference(model, image_size, output_dir='model'):
-    """
-    Export model and preprocessing components for inference
-    """
     os.makedirs(output_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(output_dir, 'model.pth'))
     
-    # Save model weights
-    model_path = os.path.join(output_dir, 'model.pth')
-    torch.save(model.state_dict(), model_path)
-    
-    # Save model architecture info with updated action columns
     model_info = {
-        'input_dim': model.network[0].in_features,
-        'hidden_dims': [layer.out_features for layer in model.network if isinstance(layer, nn.Linear)][:-1],
-        'output_dim': model.network[-1].out_features,
-        'image_size': image_size,
+        'model_class': model.__class__.__name__,
+        'image_shape': [1, image_size[1], image_size[0]], # C, H, W
+        'other_features_dim': 4,
+        'num_actions': 5,
         'action_columns': ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
     }
-    
-    info_path = os.path.join(output_dir, 'model_info.json')
-    with open(info_path, 'w') as f:
+    with open(os.path.join(output_dir, 'model_info.json'), 'w') as f:
         json.dump(model_info, f, indent=2)
     
     print(f"Model exported to {output_dir}/")
-    print("Files created:")
-    print("- model.pth: PyTorch model weights")
-    print("- model_info.json: Model architecture and action mapping")
 
 def load_model_for_inference(model_dir='model'):
     """
-    Load model for inference (example usage)
+    Loads a CNN model and its metadata for inference.
     """
-    # Load model info
-    with open(os.path.join(model_dir, 'model_info.json'), 'r') as f:
+    model_info_path = os.path.join(model_dir, 'model_info.json')
+    if not os.path.exists(model_info_path):
+        raise FileNotFoundError(f"model_info.json not found in {model_dir}")
+
+    with open(model_info_path, 'r') as f:
         model_info = json.load(f)
-    
-    # Recreate model
+
+    # Recreate model from the info file
     model = BehavioralCloningNet(
-        input_dim=model_info['input_dim'],
-        hidden_dims=model_info['hidden_dims'],
-        output_dim=model_info['output_dim']
+        image_shape=tuple(model_info['image_shape']),
+        other_features_dim=model_info['other_features_dim'],
+        num_actions=model_info['num_actions']
     )
     
     # Load weights
-    model.load_state_dict(torch.load(os.path.join(model_dir, 'model.pth'), 
-                                   map_location='cpu'))
-    
+    weights_path = os.path.join(model_dir, 'model.pth')
+    model.load_state_dict(torch.load(weights_path, map_location=torch.device('cpu')))
     model.eval()
-    return model, model_info['image_size'], model_info['action_columns']
+    
+    return model, model_info
 
 def main():
-    print("Script started!")
-    """Main training script"""
-    # Configuration
+    """Main script to train an ensemble of quality-controlled CNN models."""
+    # --- Configuration ---
     DATA_DIR = r"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\HKData"
-    BATCH_SIZE = 64
-    EPOCHS = 100
-    LEARNING_RATE = 0.001
-    IMAGE_SIZE = (80, 60)  # Smaller size for faster training
-    TRAIN_ON_ALL_DATA = True # Set to True to train on all data in HKData
+    TRAIN_ON_ALL_DATA = True # Set to False to train on only the latest data session
+    ENABLE_DATA_AUGMENTATION = False # Set to False to disable image augmentations
+    NUM_MODELS_TO_FIND = 3
+    MAX_TRIALS = 100
+    MIN_ACTION_ACCURACY = 0.5
 
     # --- Data Loading ---
     csv_files = [f for f in os.listdir(DATA_DIR) if f.startswith('hk_actions_') and f.endswith('.csv')]
     if not csv_files:
-        print(f"No CSV files found in {DATA_DIR}")
-        return
+        print(f"No CSV files found in {DATA_DIR}. Exiting."); return
 
     data_to_load = []
     if TRAIN_ON_ALL_DATA:
@@ -433,100 +378,114 @@ def main():
     for csv_file in data_to_load:
         session_id = csv_file.replace('hk_actions_', '').replace('.csv', '')
         frames_dir = os.path.join(DATA_DIR, f'frames_{session_id}')
-        csv_path = os.path.join(DATA_DIR, csv_file)
-
         if os.path.exists(frames_dir):
-            print(f"Processing session: {session_id}")
-            df = pd.read_csv(csv_path)
+            df = pd.read_csv(os.path.join(DATA_DIR, csv_file))
             df['frame_path'] = df['frame_id'].apply(lambda x: os.path.join(frames_dir, f"frame_{x:06d}.png"))
             all_dfs.append(df)
-        else:
-            print(f"Warning: Frames directory not found for session {session_id}, skipping.")
-
-    if not all_dfs:
-        print("No data could be loaded.")
-        return
-        
+    
+    if not all_dfs: print("No data could be loaded. Exiting."); return
     master_df = pd.concat(all_dfs, ignore_index=True)
+    if len(master_df) == 0: print("No valid data in master DataFrame. Exiting."); return
 
-    # Create dataset
-    dataset = HollowKnightDataset(
-        data_df=master_df,
-        image_size=IMAGE_SIZE
-    )
-    
-    if len(dataset) == 0:
-        print("No valid data found!")
-        return
-    
-    # Add detailed analysis of action distribution
-    print("\n=== Detailed Action Analysis ===")
-    df = dataset.data
-    for col in dataset.action_columns:
-        true_count = df[col].sum()
-        false_count = len(df) - true_count
-        ratio = true_count / false_count if false_count > 0 else float('inf')
-        print(f"{col:15s}: True={true_count:5d}, False={false_count:5d}, Ratio={ratio:.3f}")
-    
-    # Check for data quality issues
-    print("\n=== Data Quality Check ===")
-    # Check if player is always moving left
-    always_left = df['moving_left'].all()
-    never_right = not df['moving_right'].any()
-    print(f"Always moving left: {always_left}")
-    print(f"Never moving right: {never_right}")
-    
-    # Check position variance
-    pos_variance = df[['x_position', 'y_position']].var()
-    print(f"Position variance - X: {pos_variance['x_position']:.2f}, Y: {pos_variance['y_position']:.2f}")
-    
-    # Split data
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-    
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
-    
-    # Create model - input dimension now includes image + 4 position features
-    input_dim = IMAGE_SIZE[0] * IMAGE_SIZE[1] + 4  # Flattened image + player_x, player_y, enemy_x, enemy_y
-    model = BehavioralCloningNet(
-        input_dim=input_dim,
-        hidden_dims=[512, 256, 128],
-        output_dim=len(dataset.action_columns),
-        dropout_rate=0.5  # Increase dropout to reduce overfitting
-    )
-    
-    print(f"Model input dimension: {input_dim}")
-    
-    # Create trainer
-    trainer = BehavioralCloningTrainer(model)
-    
-    # Train model with adjusted learning rate
-    trainer.train(train_loader, val_loader, epochs=EPOCHS, learning_rate=0.0005)  # Lower learning rate
-    
-    # Plot training history
-    trainer.plot_training_history()
-    
-    # Export model for inference
-    export_model_for_inference(model, IMAGE_SIZE)
-    
-    print("Training completed and model exported!")
-    
-    # Test inference (example)
-    print("\nTesting inference...")
-    loaded_model, image_size, action_columns = load_model_for_inference()
-    print(f"Model loaded successfully!")
-    print(f"Image size: {image_size}")
-    print(f"Action columns: {action_columns}")
 
+    # Data Augmentation (for training only)
+    if ENABLE_DATA_AUGMENTATION:
+        train_transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.RandomAffine(degrees=5, translate=(0.05, 0.05)),
+            transforms.ToTensor() # Convert PIL Image to PyTorch Tensor
+        ])
+    else:
+        train_transform = transforms.Compose([
+            transforms.ToTensor()
+        ])
+
+    # No augmentation for validation, just ToTensor
+    val_transform = transforms.Compose([
+        transforms.ToTensor()
+    ])
+
+    # --- Ensemble Training via Filter and Collect ---
+    print(f"\n--- Searching for {NUM_MODELS_TO_FIND} 'Good' Models (Min Action Accuracy > {MIN_ACTION_ACCURACY}) ---")
+    print(f"Maximum trials: {MAX_TRIALS}\n")
+    
+    search_space = {
+        'learning_rate': [5e-5, 1e-4, 5e-4],
+        'dropout_rate': [0.3, 0.4, 0.5],
+        'weight_decay': [1e-5, 1e-4, 5e-4],
+        'loss_type': ['bce', 'focal'],
+        'image_size': [(80,40),(160, 75),(320,130)],
+        'batch_size': [32, 64]
+    }
+    
+    saved_models_count = 0
+    for trial in range(MAX_TRIALS):
+        if saved_models_count >= NUM_MODELS_TO_FIND:
+            print(f"Successfully found {NUM_MODELS_TO_FIND} models. Halting search.")
+            break
+
+        print(f"\n--- Trial {trial + 1}/{MAX_TRIALS} | Models Found: {saved_models_count}/{NUM_MODELS_TO_FIND} ---")
+        
+        hp = {k: random.choice(v) for k, v in search_space.items()}
+        print(f"Sampled Hyperparameters: {json.dumps(hp, indent=2)}")
+        
+        # Split dataframes for this trial
+        train_df, val_df = train_test_split(master_df, test_size=0.2, random_state=42) # Using a fixed random_state for reproducibility
+
+        # Create datasets for this trial with specific image_size and transforms
+        train_trial_dataset = HollowKnightDataset(
+            data_df=train_df,
+            image_size=hp['image_size'],
+            transform=train_transform
+        )
+        val_trial_dataset = HollowKnightDataset(
+            data_df=val_df,
+            image_size=hp['image_size'],
+            transform=val_transform
+        )
+        
+        if len(train_trial_dataset) == 0 or len(val_trial_dataset) == 0:
+            print(f"Skipping trial {trial+1}: Not enough valid data found after splitting for image size {hp['image_size']}")
+            continue
+            
+        train_loader = DataLoader(train_trial_dataset, batch_size=hp['batch_size'], shuffle=True)
+        val_loader = DataLoader(val_trial_dataset, batch_size=hp['batch_size'], shuffle=False)
+        
+        model = BehavioralCloningNet(
+            image_shape=(1, hp['image_size'][1], hp['image_size'][0]), # C, H, W
+            dropout_rate=hp['dropout_rate']
+        )
+        
+        trainer = BehavioralCloningTrainer(model)
+        _, final_accuracies = trainer.train(
+            train_loader, val_loader, epochs=100,
+            learning_rate=hp['learning_rate'], 
+            weight_decay=hp['weight_decay'],
+            loss_type=hp['loss_type']
+        )
+        
+        # --- Quality Control Check ---
+        if all(acc > MIN_ACTION_ACCURACY for acc in final_accuracies):
+            saved_models_count += 1
+            print(f"\nSUCCESS! Model passed quality check. Saving as ensemble member #{saved_models_count}.")
+            output_dir = f"model/ensemble_{saved_models_count}"
+            export_model_for_inference(model, hp['image_size'], output_dir=output_dir)
+            trainer.plot_training_history(save_path=os.path.join(output_dir, 'training_history.png'))
+            # Save hyperparameters with the model
+            with open(os.path.join(output_dir, 'hyperparameters.json'), 'w') as f:
+                json.dump(hp, f, indent=2)
+        else:
+            print("\nFAILURE. Model did not meet the minimum accuracy for all actions. Discarding.")
+
+    print(f"\n--- Search Complete ---")
+    print(f"Found {saved_models_count} models that met the quality criteria.")
+
+    # --- Cleanup ---
     if os.path.exists('best_model.pth'):
         os.remove('best_model.pth')
-    print("Cleaned up temporary checkpoint file")
-
+        print("Cleaned up temporary checkpoint file.")
 
 if __name__ == "__main__":
+    import torch.nn.functional as F
     main()

@@ -1,0 +1,17 @@
+{
+  "model_class": "BehavioralCloningNet",
+  "image_shape": [
+    1,
+    75,
+    160
+  ],
+  "other_features_dim": 4,
+  "num_actions": 5,
+  "action_columns": [
+    "moving_left",
+    "moving_right",
+    "attacking",
+    "jumping",
+    "dashing"
+  ]
+}

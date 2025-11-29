@@ -1,0 +1,11 @@
+{
+  "learning_rate": 5e-05,
+  "dropout_rate": 0.4,
+  "weight_decay": 1e-05,
+  "loss_type": "bce",
+  "image_size": [
+    80,
+    40
+  ],
+  "batch_size": 32
+}
