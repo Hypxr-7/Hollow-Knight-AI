@@ -437,7 +437,7 @@ def main():
         'dropout_rate': [0.3, 0.4, 0.5],
         'weight_decay': [1e-5, 1e-4, 5e-4],
         'loss_type': ['bce', 'focal'],
-        'image_size': [(160, 75),(320,130)],#(80,40), removed for now
+        'image_size': [(160, 90),(320,160)],#(80,40), removed for now
         'batch_size': [32, 64]
     }
     
