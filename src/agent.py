@@ -44,6 +44,10 @@ class EnsembleAgent:
             'attacking': 'x', 'jumping': 'z', 'dashing': 'c'
         }
         self.pressed_keys = set()
+        
+        # Optimize PyAutoGUI speed
+        pyautogui.PAUSE = 0
+        
         print(f"Ensemble loaded with {len(self.models_with_info)} models.")
 
     def predict_from_bytes(self, image_bytes, width, height, player_x=0.5, player_y=0.5, enemy_x=0.0, enemy_y=0.0):
