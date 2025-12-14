@@ -127,6 +127,7 @@ class BehavioralCloningNet(nn.Module):
     """
     CNN for multi-label behavioral cloning.
     Processes image data with convolutional layers and combines it with positional data.
+    Uses Global Average Pooling for resolution independence.
     """
     def __init__(self, image_shape=(1, 60, 80), other_features_dim=4, num_actions=5, dropout_rate=0.5):
         super(BehavioralCloningNet, self).__init__()
@@ -137,27 +138,32 @@ class BehavioralCloningNet(nn.Module):
         self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-
-        self._conv_out_shape = self._get_conv_out_shape(image_shape)
         
-        self.fc1 = nn.Linear(self._conv_out_shape + other_features_dim, 256)
+        # MaxPool for downsampling features
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # Global Average Pooling: Converts (N, 64, H, W) -> (N, 64, 1, 1)
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Fully connected layers
+        # Input size is fixed to 64 (channels) + 4 (other features)
+        self.fc1 = nn.Linear(64 + other_features_dim, 256)
         self.bn3 = nn.BatchNorm1d(256)
         self.dropout = nn.Dropout(dropout_rate)
         self.fc2 = nn.Linear(256, num_actions)
 
-    def _get_conv_out_shape(self, shape):
-        with torch.no_grad():
-            dummy_tensor = torch.zeros(1, *shape) # (N, C, H, W)
-            x = self.pool(F.relu(self.bn1(self.conv1(dummy_tensor))))
-            x = self.pool(F.relu(self.bn2(self.conv2(x))))
-            return int(np.prod(x.shape))
-
     def forward(self, image, other_features):
         x = self.pool(F.relu(self.bn1(self.conv1(image))))
         x = self.pool(F.relu(self.bn2(self.conv2(x))))
-        x = x.view(x.size(0), -1)
+        
+        # Global Pooling & Flatten
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1) # Flatten (N, 64, 1, 1) -> (N, 64)
+        
+        # Concatenate with other features
         combined = torch.cat([x, other_features], dim=1)
+        
+        # Pass through fully connected layers
         combined = F.relu(self.bn3(self.fc1(combined)))
         combined = self.dropout(combined)
         output = self.fc2(combined)
@@ -436,8 +442,8 @@ def main():
         'learning_rate': [5e-5, 1e-4, 5e-4],
         'dropout_rate': [0.3, 0.4, 0.5],
         'weight_decay': [1e-5, 1e-4, 5e-4],
-        'loss_type': ['bce', 'focal'],
-        'image_size': [(160, 90),(320,160)],#(80,40), removed for now
+        'loss_type': ['focal'],#removed bce loss for now 'bce'
+        'image_size': [(320, 180)],#(80,45),(320,180),(160,90) ,(640, 360)removed for now
         'batch_size': [32, 64]
     }
     
