@@ -31,63 +31,86 @@ class HollowKnightDataset(Dataset):
     """
     Dataset for Hollow Knight behavioral cloning.
     Prepares image and positional data for the CNN model.
+    Supports frame stacking for temporal context.
     """
-    def __init__(self, data_df, transform=None, image_size=(80, 60)):
+    def __init__(self, data_df, transform=None, image_size=(80, 60), n_frames=1):
         self.data = data_df.copy() # Use a copy to avoid SettingWithCopyWarning
         self.transform = transform
+        self.image_size = image_size
+        self.n_frames = n_frames
         self.action_columns = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
         
-        # Directly filter the dataframe to only include rows with valid frame paths
-        # This is much safer than collecting and using indices after a train/test split.
+        # Filter valid frames
         self.data = self.data[self.data['frame_path'].apply(os.path.exists)].reset_index(drop=True)
 
-        self.image_size = image_size
-        
         if not self.image_size:
             self.image_size = self._get_original_image_size()
 
-        print(f"Dataset loaded: {len(self.data)} samples with valid frames")
-        if self.image_size:
-            print(f"Image size: {self.image_size}")
-        else:
-            print("Image size: Not determined (no valid frames found).")
+        print(f"Dataset loaded: {len(self.data)} samples")
+        print(f"Image size: {self.image_size}")
+        print(f"Frame Stacking: {self.n_frames} frames")
         
-        print("\n=== Action Distribution ===")
-        for col in self.action_columns:
-            count = self.data[col].sum()
-            pct = (count / len(self.data)) * 100 if len(self.data) > 0 else 0
-            print(f"{col:15s}: {int(count):5d} frames ({pct:.1f}%)")
-        
-        enemy_present = ((self.data['enemy_x'] != 0) | (self.data['enemy_y'] != 0)).sum()
-        enemy_pct = (enemy_present / len(self.data)) * 100 if len(self.data) > 0 else 0
-        print(f"{'enemy_present':15s}: {int(enemy_present):5d} frames ({enemy_pct:.1f}%)")
-    
     def _get_original_image_size(self):
         if len(self.data) > 0:
             first_frame_path = self.data['frame_path'].iloc[0]
             if os.path.exists(first_frame_path):
                 with Image.open(first_frame_path) as img:
-                    return img.size # (width, height)
+                    return img.size 
         return None
+
+    def _get_previous_frame_path(self, current_path, current_id, offset):
+        # Reconstruct path for frame_id - offset
+        # Assumes format: .../frame_XXXXXX.png
+        dir_name = os.path.dirname(current_path)
+        prev_id = current_id - offset
+        return os.path.join(dir_name, f"frame_{prev_id:06d}.png")
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
+        current_frame_id = row['frame_id']
+        current_frame_path = row['frame_path']
         
-        # Load image, ensure it's grayscale, and resize
-        with Image.open(row['frame_path']).convert('L') as img:
-            if self.image_size:
-                img = img.resize(self.image_size, Image.Resampling.LANCZOS)
-            
-            if self.transform:
-                img = self.transform(img)
+        frames = []
+        
+        # Load sequence of frames (newest to oldest or oldest to newest?)
+        # Standard convention: Channels [0..N] correspond to [t, t-1, t-2...] (newest first)
+        # or [t-(N-1), ..., t] (oldest first).
+        # Let's do [t, t-1, t-2...] so Channel 0 is always the current frame.
+        
+        for i in range(self.n_frames):
+            if i == 0:
+                path = current_frame_path
             else:
-                # Default transform to tensor and normalize
-                img = transforms.ToTensor()(img)
+                path = self._get_previous_frame_path(current_frame_path, current_frame_id, i)
+            
+            # Load and process image
+            if os.path.exists(path):
+                with Image.open(path).convert('L') as img:
+                    if self.image_size:
+                        img = img.resize(self.image_size, Image.Resampling.LANCZOS)
+                    # Convert to tensor immediately (1, H, W)
+                    img_tensor = transforms.ToTensor()(img)
+                    frames.append(img_tensor)
+            else:
+                # Padding: Duplicate the last successfully loaded frame
+                # If even the current frame is missing (unlikely due to filter), we have a problem.
+                if frames:
+                    frames.append(frames[-1])
+                else:
+                    # Fallback for current frame if filesystem changed
+                    frames.append(torch.zeros(1, self.image_size[1], self.image_size[0]))
 
-        # Other features (player and enemy positions)
+        # Stack frames along channel dimension: (N_frames, H, W)
+        image_stack = torch.cat(frames, dim=0)
+        
+        # Apply transforms if any (must support multi-channel tensor)
+        if self.transform:
+            image_stack = self.transform(image_stack)
+
+        # Other features
         other_features = torch.FloatTensor([
             row['x_position'] / 1920.0,
             row['y_position'] / 1080.0,
@@ -97,8 +120,7 @@ class HollowKnightDataset(Dataset):
         
         actions = torch.FloatTensor([float(row[col]) for col in self.action_columns])
         
-        # Return image, other features, and actions separately
-        return img, other_features, actions
+        return image_stack, other_features, actions
 
 
 class BehavioralCloningNet(nn.Module):
@@ -110,23 +132,21 @@ class BehavioralCloningNet(nn.Module):
         super(BehavioralCloningNet, self).__init__()
         
         # Convolutional layers for image processing
+        # in_channels comes from image_shape[0] (which is n_frames)
         self.conv1 = nn.Conv2d(in_channels=image_shape[0], out_channels=32, kernel_size=5, padding=2)
         self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2) # Reduces dimensions by half
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        # Calculate flattened size after conv and pooling layers
         self._conv_out_shape = self._get_conv_out_shape(image_shape)
         
-        # Fully connected layers
         self.fc1 = nn.Linear(self._conv_out_shape + other_features_dim, 256)
         self.bn3 = nn.BatchNorm1d(256)
         self.dropout = nn.Dropout(dropout_rate)
         self.fc2 = nn.Linear(256, num_actions)
 
     def _get_conv_out_shape(self, shape):
-        # Create a dummy tensor and pass it through the conv layers to find output shape
         with torch.no_grad():
             dummy_tensor = torch.zeros(1, *shape) # (N, C, H, W)
             x = self.pool(F.relu(self.bn1(self.conv1(dummy_tensor))))
@@ -134,21 +154,13 @@ class BehavioralCloningNet(nn.Module):
             return int(np.prod(x.shape))
 
     def forward(self, image, other_features):
-        # Process image through CNN
         x = self.pool(F.relu(self.bn1(self.conv1(image))))
         x = self.pool(F.relu(self.bn2(self.conv2(x))))
-        
-        # Flatten the output of the CNN
         x = x.view(x.size(0), -1)
-        
-        # Concatenate with other features
         combined = torch.cat([x, other_features], dim=1)
-        
-        # Pass through fully connected layers
         combined = F.relu(self.bn3(self.fc1(combined)))
         combined = self.dropout(combined)
-        output = self.fc2(combined) # No sigmoid, handled by BCEWithLogitsLoss
-        
+        output = self.fc2(combined)
         return output
 
 
@@ -188,6 +200,7 @@ class BehavioralCloningTrainer:
     def validate(self, val_loader, criterion):
         self.model.eval()
         val_loss, exact_matches, total_samples = 0, 0, 0
+        total_correct_bits = 0
         action_correct = torch.zeros(5, device=self.device)
         action_total = torch.zeros(5, device=self.device)
         
@@ -200,7 +213,13 @@ class BehavioralCloningTrainer:
                 val_loss += loss.item()
                 
                 predicted = (torch.sigmoid(outputs) > 0.5).float()
+                
+                # Exact match (all 5 actions correct)
                 exact_matches += (predicted == actions).all(dim=1).sum().item()
+                
+                # Partial match (count total correct individual bits)
+                total_correct_bits += (predicted == actions).sum().item()
+                
                 total_samples += actions.size(0)
                 
                 for i in range(5):
@@ -209,9 +228,10 @@ class BehavioralCloningTrainer:
         
         avg_val_loss = val_loss / len(val_loader)
         exact_match_accuracy = exact_matches / total_samples
+        partial_match_accuracy = total_correct_bits / (total_samples * 5) # 5 actions
         per_action_acc = [corr.item() / total.item() if total.item() > 0 else 0 for corr, total in zip(action_correct, action_total)]
         
-        return avg_val_loss, exact_match_accuracy, per_action_acc
+        return avg_val_loss, exact_match_accuracy, partial_match_accuracy, per_action_acc
     
     def plot_training_history(self, save_path='training_history.png'):
         if not self.train_losses: return
@@ -225,7 +245,8 @@ class BehavioralCloningTrainer:
         axes[0, 0].legend()
         
         axes[0, 1].plot(self.val_accuracies, label='Exact Match Accuracy', color='green')
-        axes[0, 1].set_title('Exact Match Accuracy')
+        axes[0, 1].plot(self.partial_accuracies, label='Partial Match Accuracy', color='orange', linestyle='--')
+        axes[0, 1].set_title('Accuracy')
         axes[0, 1].grid(True)
         axes[0, 1].legend()
 
@@ -251,6 +272,7 @@ class BehavioralCloningTrainer:
 
     def train(self, train_loader, val_loader, epochs, learning_rate, weight_decay, loss_type):
         self.reset_history()
+        self.partial_accuracies = [] # Store partial accuracies for plotting
         
         pos_weights = []
         for i, col in enumerate(train_loader.dataset.action_columns):
@@ -284,7 +306,7 @@ class BehavioralCloningTrainer:
                 train_loss += loss.item()
             
             avg_train_loss = train_loss / len(train_loader)
-            val_loss, val_accuracy, per_action_acc = self.validate(val_loader, criterion)
+            val_loss, val_accuracy, partial_accuracy, per_action_acc = self.validate(val_loader, criterion)
             scheduler.step(val_loss)
             
             if val_loss < best_val_loss:
@@ -297,10 +319,11 @@ class BehavioralCloningTrainer:
             self.train_losses.append(avg_train_loss)
             self.val_losses.append(val_loss)
             self.val_accuracies.append(val_accuracy)
+            self.partial_accuracies.append(partial_accuracy)
             self.per_action_accuracies.append(per_action_acc)
             
             per_action_str = ", ".join([f"{acc:.2f}" for acc in per_action_acc])
-            print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}, Exact Match: {val_accuracy:.3f}, Actions: [{per_action_str}]")
+            print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | Exact: {val_accuracy:.3f} | Partial: {partial_accuracy:.3f} | Actions: [{per_action_str}]")
             
             if patience_counter >= patience:
                 print(f"Early stopping after {epoch+1} epochs.")
@@ -310,16 +333,17 @@ class BehavioralCloningTrainer:
         print("Training completed!")
         return best_val_loss, self.per_action_accuracies[-1] if self.per_action_accuracies else [0]*5
 
-def export_model_for_inference(model, image_size, output_dir='model'):
+def export_model_for_inference(model, image_size, n_frames, output_dir='model'):
     os.makedirs(output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(output_dir, 'model.pth'))
     
     model_info = {
         'model_class': model.__class__.__name__,
-        'image_shape': [1, image_size[1], image_size[0]], # C, H, W
+        'image_shape': [n_frames, image_size[1], image_size[0]], # C, H, W (C is stack size)
         'other_features_dim': 4,
         'num_actions': 5,
-        'action_columns': ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
+        'action_columns': ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing'],
+        'n_frames': n_frames
     }
     with open(os.path.join(output_dir, 'model_info.json'), 'w') as f:
         json.dump(model_info, f, indent=2)
@@ -337,7 +361,9 @@ def load_model_for_inference(model_dir='model'):
     with open(model_info_path, 'r') as f:
         model_info = json.load(f)
 
-    # Recreate model from the info file
+    # Handle legacy models without n_frames
+    n_frames = model_info.get('n_frames', 1)
+
     model = BehavioralCloningNet(
         image_shape=tuple(model_info['image_shape']),
         other_features_dim=model_info['other_features_dim'],
@@ -355,11 +381,12 @@ def main():
     """Main script to train an ensemble of quality-controlled CNN models."""
     # --- Configuration ---
     DATA_DIR = r"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\HKData"
-    TRAIN_ON_ALL_DATA = True # Set to False to train on only the latest data session
-    ENABLE_DATA_AUGMENTATION = False # Set to False to disable image augmentations
+    TRAIN_ON_ALL_DATA = True
+    ENABLE_DATA_AUGMENTATION = False # Disabled for now 
     NUM_MODELS_TO_FIND = 3
     MAX_TRIALS = 100
     MIN_ACTION_ACCURACY = 0.5
+    STACK_SIZE = 3 # Number of frames to stack
 
     # --- Data Loading ---
     csv_files = [f for f in os.listdir(DATA_DIR) if f.startswith('hk_actions_') and f.endswith('.csv')]
@@ -388,34 +415,29 @@ def main():
     if len(master_df) == 0: print("No valid data in master DataFrame. Exiting."); return
 
 
-    # Data Augmentation (for training only)
+    # Data Augmentation (Modified for Stacked Tensors)
+    # Note: ToTensor() is handled by dataset now.
     if ENABLE_DATA_AUGMENTATION:
         train_transform = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
             transforms.RandomAffine(degrees=5, translate=(0.05, 0.05)),
-            transforms.ToTensor() # Convert PIL Image to PyTorch Tensor
+            # Removed ColorJitter to avoid issues with >3 channels
         ])
     else:
-        train_transform = transforms.Compose([
-            transforms.ToTensor()
-        ])
+        train_transform = None
 
-    # No augmentation for validation, just ToTensor
-    val_transform = transforms.Compose([
-        transforms.ToTensor()
-    ])
+    val_transform = None # Dataset handles basic loading
 
     # --- Ensemble Training via Filter and Collect ---
     print(f"\n--- Searching for {NUM_MODELS_TO_FIND} 'Good' Models (Min Action Accuracy > {MIN_ACTION_ACCURACY}) ---")
-    print(f"Maximum trials: {MAX_TRIALS}\n")
+    print(f"Frame Stacking: {STACK_SIZE}")
     
     search_space = {
         'learning_rate': [5e-5, 1e-4, 5e-4],
         'dropout_rate': [0.3, 0.4, 0.5],
         'weight_decay': [1e-5, 1e-4, 5e-4],
         'loss_type': ['bce', 'focal'],
-        'image_size': [(80,40),(160, 75),(320,130)],
+        'image_size': [(160, 75),(320,130)],#(80,40), removed for now
         'batch_size': [32, 64]
     }
     
@@ -431,29 +453,32 @@ def main():
         print(f"Sampled Hyperparameters: {json.dumps(hp, indent=2)}")
         
         # Split dataframes for this trial
-        train_df, val_df = train_test_split(master_df, test_size=0.2, random_state=42) # Using a fixed random_state for reproducibility
+        train_df, val_df = train_test_split(master_df, test_size=0.2, random_state=42)
 
-        # Create datasets for this trial with specific image_size and transforms
+        # Create datasets
         train_trial_dataset = HollowKnightDataset(
             data_df=train_df,
             image_size=hp['image_size'],
-            transform=train_transform
+            transform=train_transform,
+            n_frames=STACK_SIZE
         )
         val_trial_dataset = HollowKnightDataset(
             data_df=val_df,
             image_size=hp['image_size'],
-            transform=val_transform
+            transform=val_transform,
+            n_frames=STACK_SIZE
         )
         
-        if len(train_trial_dataset) == 0 or len(val_trial_dataset) == 0:
-            print(f"Skipping trial {trial+1}: Not enough valid data found after splitting for image size {hp['image_size']}")
+        if len(train_trial_dataset) == 0:
+            print(f"Skipping trial {trial+1}: Not enough data.")
             continue
             
         train_loader = DataLoader(train_trial_dataset, batch_size=hp['batch_size'], shuffle=True)
         val_loader = DataLoader(val_trial_dataset, batch_size=hp['batch_size'], shuffle=False)
         
+        # Initialize model with stack size as channels
         model = BehavioralCloningNet(
-            image_shape=(1, hp['image_size'][1], hp['image_size'][0]), # C, H, W
+            image_shape=(STACK_SIZE, hp['image_size'][1], hp['image_size'][0]), 
             dropout_rate=hp['dropout_rate']
         )
         
@@ -470,9 +495,9 @@ def main():
             saved_models_count += 1
             print(f"\nSUCCESS! Model passed quality check. Saving as ensemble member #{saved_models_count}.")
             output_dir = f"model/ensemble_{saved_models_count}"
-            export_model_for_inference(model, hp['image_size'], output_dir=output_dir)
+            export_model_for_inference(model, hp['image_size'], STACK_SIZE, output_dir=output_dir)
             trainer.plot_training_history(save_path=os.path.join(output_dir, 'training_history.png'))
-            # Save hyperparameters with the model
+            # Save hyperparameters
             with open(os.path.join(output_dir, 'hyperparameters.json'), 'w') as f:
                 json.dump(hp, f, indent=2)
         else:
@@ -481,10 +506,8 @@ def main():
     print(f"\n--- Search Complete ---")
     print(f"Found {saved_models_count} models that met the quality criteria.")
 
-    # --- Cleanup ---
     if os.path.exists('best_model.pth'):
         os.remove('best_model.pth')
-        print("Cleaned up temporary checkpoint file.")
 
 if __name__ == "__main__":
     import torch.nn.functional as F
