@@ -34,6 +34,9 @@ def get_predictions(models_with_info, master_df, device='cpu'):
     final_frame_ids = None
 
     class TempEvalDataset(HollowKnightDataset):
+        def __init__(self, data_df, image_size, n_frames):
+            super().__init__(data_df=data_df, image_size=image_size, n_frames=n_frames)
+
         def __getitem__(self, idx):
             img, other_features, actions = super().__getitem__(idx)
             frame_id = self.data.iloc[idx]['frame_id']
@@ -44,10 +47,18 @@ def get_predictions(models_with_info, master_df, device='cpu'):
         model.to(device)
         model.eval()
 
-        image_size = tuple(info['image_shape'][2:0:-1]) # (W, H)
-        print(f"Using image size: {image_size}")
+        # Handle legacy models or different shapes
+        n_frames = info.get('n_frames', 1)
+        if 'image_shape' in info and len(info['image_shape']) == 3:
+            n_frames = max(n_frames, info['image_shape'][0])
+            
+        target_h = info['image_shape'][1]
+        target_w = info['image_shape'][2]
+        image_size = (target_w, target_h) # PIL uses (W, H)
 
-        temp_dataset = TempEvalDataset(data_df=master_df.copy(), image_size=image_size)
+        print(f"Using image size: {image_size}, n_frames: {n_frames}")
+
+        temp_dataset = TempEvalDataset(data_df=master_df.copy(), image_size=image_size, n_frames=n_frames)
         temp_loader = DataLoader(temp_dataset, batch_size=64, shuffle=False)
         
         current_model_labels, current_model_preds, current_model_frame_ids, current_model_embeddings = [], [], [], []
@@ -56,11 +67,16 @@ def get_predictions(models_with_info, master_df, device='cpu'):
             for images, other_features, labels, frame_ids in tqdm(temp_loader, desc=f"Model {i+1} Predictions"):
                 images, other_features, labels = images.to(device), other_features.to(device), labels.to(device)
                 
+                # Manually run forward pass to get embeddings
                 x = model.pool(torch.nn.functional.relu(model.bn1(model.conv1(images))))
                 x = model.pool(torch.nn.functional.relu(model.bn2(model.conv2(x))))
                 x = x.view(x.size(0), -1)
                 combined = torch.cat([x, other_features], dim=1)
+                
+                # Get embedding (penultimate layer output)
                 embedding = torch.nn.functional.relu(model.bn3(model.fc1(combined)))
+                
+                # Get final prediction
                 output = model.fc2(model.dropout(embedding))
                 probabilities = torch.sigmoid(output)
 

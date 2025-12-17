@@ -3,56 +3,68 @@ using System.IO;
 using System.Diagnostics;
 using System.Text;
 using System.Threading;
+using System.Collections.Concurrent;
 using UnityEngine;
 using Modding;
 
 namespace GameAgent
 {
-    public class GameAgentMod : Mod
+    public class GameAgentMod : Mod, ITogglableMod
     {
         // Configuration
         public string pythonScriptPath = @"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\src\agent.py";
         public string modelPath = @"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\model";
 
         private bool isAIActive = false;
-        private float inferenceTimer = 0f;
-        private float inferenceInterval = 1f / 10f; // 10 FPS
+        private volatile bool waitingForPrediction = false;
 
         private Process pythonProcess;
         private Thread readerThread;
+        private Thread processingThread;
         private volatile bool threadRunning = false;
 
-        private int targetWidth = 160;
-        private int targetHeight = 120;
+        // CRITICAL FIX: Match data collection resolution!
+        private int targetWidth = 640;
+        private int targetHeight = 360;
 
-        private string lastKeysPressed = "";
+        // Reusable texture to avoid GC allocs
+        private Texture2D captureTexture;
+
+        // Data container
+        private struct FrameData
+        {
+            public byte[] pixels;
+            public float playerX;
+            public float playerY;
+            public float enemyX;
+            public float enemyY;
+        }
+
+        // Queue for offloading processing
+        private ConcurrentQueue<FrameData> frameQueue = new ConcurrentQueue<FrameData>();
 
         public GameAgentMod() : base("Game Agent") { }
-        public override string GetVersion() => "T3.0";
+        public override string GetVersion() => "T3.2-Resolution-Fixed";
 
         public override void Initialize()
         {
+            ModHooks.HeroUpdateHook -= OnHeroUpdate;
             ModHooks.HeroUpdateHook += OnHeroUpdate;
             Log("AI Inference Mod initialized! Press 'P' to toggle AI");
         }
 
         public void OnHeroUpdate()
         {
-            // Toggle AI with P key
             if (Input.GetKeyDown(KeyCode.P))
             {
                 ToggleAI();
             }
 
-            // Run inference if active
-            if (isAIActive)
+            // DYNAMIC SYNC: Only capture if Python has finished the previous frame
+            if (isAIActive && !waitingForPrediction)
             {
-                inferenceTimer += Time.deltaTime;
-                if (inferenceTimer >= inferenceInterval)
-                {
-                    RunInference();
-                    inferenceTimer = 0f;
-                }
+                CaptureAndEnqueue();
+                waitingForPrediction = true; // Block until Python replies
             }
         }
 
@@ -60,18 +72,33 @@ namespace GameAgent
         {
             if (isAIActive)
             {
-                // Stopping AI
                 isAIActive = false;
-                Log("AI DEACTIVATED - Releasing all keys...");
+                waitingForPrediction = false;
+                Log("AI DEACTIVATED");
                 StopPythonProcess();
+                CleanupTextures();
             }
             else
             {
-                // Starting AI
                 isAIActive = true;
+                waitingForPrediction = false;
                 Log("AI ACTIVATED");
                 StartPythonProcess();
+                InitializeTextures();
             }
+        }
+
+        private void InitializeTextures()
+        {
+            if (captureTexture == null)
+            {
+                captureTexture = new Texture2D(targetWidth, targetHeight, TextureFormat.RGB24, false);
+            }
+        }
+
+        private void CleanupTextures()
+        {
+            if (captureTexture != null) { UnityEngine.Object.Destroy(captureTexture); captureTexture = null; }
         }
 
         private void StartPythonProcess()
@@ -92,246 +119,238 @@ namespace GameAgent
                 };
 
                 pythonProcess = new Process { StartInfo = startInfo };
-
-                // Start error reader thread immediately
-                pythonProcess.ErrorDataReceived += (sender, e) =>
-                {
-                    if (!string.IsNullOrEmpty(e.Data))
-                    {
-                        Log($"Python stderr: {e.Data}");
-                    }
-                };
-
+                pythonProcess.ErrorDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) Log($"Python stderr: {e.Data}"); };
                 pythonProcess.Start();
                 pythonProcess.BeginErrorReadLine();
 
-                // Wait for READY signal with timeout
-                Log("Waiting for Python READY signal...");
-
+                Log("Waiting for Python READY...");
                 bool gotReady = false;
-                for (int i = 0; i < 10; i++) // Try reading up to 10 lines
+                for (int i = 0; i < 20; i++)
                 {
                     string line = pythonProcess.StandardOutput.ReadLine();
-                    Log($"Python output line {i}: '{line}'");
-
-                    if (line == "READY")
-                    {
-                        gotReady = true;
-                        break;
-                    }
-                    else if (line != null && line.StartsWith("ERROR:"))
-                    {
-                        Log($"Python startup error: {line}");
-                        break;
-                    }
-                    else if (line != null && line.StartsWith("FATAL:"))
-                    {
-                        Log($"Python fatal error: {line}");
-                        break;
-                    }
-
-                    if (pythonProcess.HasExited)
-                    {
-                        Log($"Python process exited with code: {pythonProcess.ExitCode}");
-                        break;
-                    }
+                    if (line == "READY") { gotReady = true; break; }
+                    if (pythonProcess.HasExited) break;
                 }
 
                 if (gotReady)
                 {
-                    Log("Python process ready!");
-
-                    // Start reader thread
+                    Log("Python ready!");
                     threadRunning = true;
-                    readerThread = new Thread(ReadPythonOutput);
-                    readerThread.IsBackground = true;
+                    
+                    // Reader Thread (reads prediction keys)
+                    readerThread = new Thread(ReadPythonOutput) { IsBackground = true };
                     readerThread.Start();
+
+                    // Processing Thread (processes images and sends to Python)
+                    processingThread = new Thread(ProcessFramesLoop) { IsBackground = true };
+                    processingThread.Start();
                 }
                 else
                 {
-                    Log("Failed to get READY signal from Python");
+                    Log("Failed to start Python.");
                     StopPythonProcess();
                     isAIActive = false;
                 }
             }
             catch (Exception ex)
             {
-                Log($"Failed to start Python: {ex.Message}");
+                Log($"Start Error: {ex.Message}");
                 isAIActive = false;
             }
         }
 
         private void StopPythonProcess()
         {
-            try
+            threadRunning = false;
+            if (pythonProcess != null && !pythonProcess.HasExited)
             {
-                threadRunning = false;
-
-                if (pythonProcess != null && !pythonProcess.HasExited)
-                {
-                    // Send quit command to release keys
-                    try
-                    {
-                        pythonProcess.StandardInput.WriteLine("QUIT");
-                        pythonProcess.StandardInput.Flush();
-                        Log("Sent QUIT command to Python");
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"Could not send QUIT: {ex.Message}");
-                    }
-
-                    // Wait for clean exit
-                    if (!pythonProcess.WaitForExit(2000))
-                    {
-                        Log("Python didn't exit cleanly, forcing kill");
-                        pythonProcess.Kill();
-                    }
-                    else
-                    {
-                        Log("Python exited cleanly");
-                    }
-                }
-
-                if (readerThread != null && readerThread.IsAlive)
-                {
-                    readerThread.Join(1000);
-                }
-
-                Log("Python process stopped, all keys should be released");
+                try 
+                { 
+                    byte[] quitBytes = Encoding.UTF8.GetBytes("QUIT\n");
+                    pythonProcess.StandardInput.BaseStream.Write(quitBytes, 0, quitBytes.Length);
+                    pythonProcess.StandardInput.BaseStream.Flush();
+                } 
+                catch {}
+                pythonProcess.WaitForExit(1000);
+                if (!pythonProcess.HasExited) pythonProcess.Kill();
             }
-            catch (Exception ex)
-            {
-                Log($"Error stopping Python: {ex.Message}");
-            }
-            finally
-            {
-                pythonProcess = null;
-            }
+            frameQueue = new ConcurrentQueue<FrameData>(); // Clear queue
         }
 
-        private void RunInference()
+        // --- Main Thread: Capture Only ---
+        private void CaptureAndEnqueue()
         {
             try
             {
-                if (pythonProcess == null || pythonProcess.HasExited)
+                // MATCH DATA COLLECTION METHOD:
+                // 1. Capture full screen directly
+                int screenWidth = Screen.width;
+                int screenHeight = Screen.height;
+                
+                Texture2D fullScreenshot = new Texture2D(screenWidth, screenHeight, TextureFormat.RGB24, false);
+                fullScreenshot.ReadPixels(new Rect(0, 0, screenWidth, screenHeight), 0, 0);
+                fullScreenshot.Apply();
+
+                // 2. Scale using RenderTexture (same as data collection)
+                RenderTexture renderTexture = RenderTexture.GetTemporary(targetWidth, targetHeight);
+                Graphics.Blit(fullScreenshot, renderTexture);
+
+                captureTexture.ReadPixels(new Rect(0, 0, targetWidth, targetHeight), 0, 0);
+                captureTexture.Apply();
+                
+                RenderTexture.active = null;
+                RenderTexture.ReleaseTemporary(renderTexture);
+                UnityEngine.Object.Destroy(fullScreenshot);
+
+                // 3. Get raw RGB24 data (3 bytes per pixel)
+                byte[] rawRgb = captureTexture.GetRawTextureData(); 
+                
+                // 4. Get position data
+                Vector3 playerPos = HeroController.instance != null ? HeroController.instance.transform.position : Vector3.zero;
+                GameObject enemy = FindCurrentEnemy();
+                Vector3 enemyPos = enemy != null ? enemy.transform.position : Vector3.zero;
+
+                FrameData frame = new FrameData
                 {
-                    Log("Python process died, restarting...");
-                    StartPythonProcess();
-                    return;
-                }
+                    pixels = rawRgb,
+                    playerX = playerPos.x,
+                    playerY = playerPos.y,
+                    enemyX = enemyPos.x,
+                    enemyY = enemyPos.y
+                };
 
-                // Capture screenshot
-                Texture2D screenshot = CaptureScreen();
-                if (screenshot == null) return;
-
-                // Convert to grayscale bytes
-                byte[] grayscaleBytes = ConvertToGrayscale(screenshot);
-                UnityEngine.Object.Destroy(screenshot);
-
-                // Encode to base64
-                string base64Image = Convert.ToBase64String(grayscaleBytes);
-
-                // Send to Python
-                string command = $"PREDICT:{targetWidth}:{targetHeight}:{base64Image}";
-                pythonProcess.StandardInput.WriteLine(command);
-                pythonProcess.StandardInput.Flush();
+                // 5. Enqueue for background processing
+                frameQueue.Enqueue(frame);
             }
             catch (Exception ex)
             {
-                Log($"Inference error: {ex.Message}");
+                Log($"Capture Error: {ex.Message}");
+                waitingForPrediction = false; // Reset on error to prevent deadlock
+            }
+        }
+
+        // --- Background Thread: Process & Send ---
+        private void ProcessFramesLoop()
+        {
+            FrameData frame;
+            // No pre-allocated buffer needed for raw pass-through if we just send frame.pixels
+            bool _debugLogged = false;
+
+            while (threadRunning)
+            {
+                if (frameQueue.TryDequeue(out frame))
+                {
+                    try
+                    {
+                        // Pass raw RGB24 data directly to Python
+                        // This ensures consistency with the training pipeline (DataCollector -> RGB -> Train -> Grayscale)
+                        byte[] dataToSend = frame.pixels;
+                        
+                        // DEBUG: Log checksum once
+                        if (!_debugLogged) {
+                            int checkSum = 0;
+                            for (int i = 0; i < Math.Min(100, dataToSend.Length); i++) {
+                                checkSum += dataToSend[i];
+                            }
+                            Log($"DEBUG: RGB checksum (first 100 bytes): {checkSum}");
+                            
+                            // Also log some sample values
+                            string sample = $"Sample pixels: [{dataToSend[0]}, {dataToSend[1]}, {dataToSend[2]}, {dataToSend[10]}, {dataToSend[100]}]";
+                            Log($"DEBUG: {sample}");
+                            _debugLogged = true;
+                        }
+                        
+                        if (pythonProcess != null && !pythonProcess.HasExited)
+                        {
+                            // Protocol: Send Header -> Flush -> Send Raw Bytes -> Flush
+                            string pX = frame.playerX.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                            string pY = frame.playerY.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                            string eX = frame.enemyX.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                            string eY = frame.enemyY.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+                            // Header now implies RGB data (width * height * 3 bytes)
+                            string header = $"PREDICT_RAW:{targetWidth}:{targetHeight}:{pX}:{pY}:{eX}:{eY}\n";
+                            byte[] headerBytes = Encoding.UTF8.GetBytes(header);
+                            
+                            pythonProcess.StandardInput.BaseStream.Write(headerBytes, 0, headerBytes.Length);
+                            pythonProcess.StandardInput.BaseStream.Flush();
+                            
+                            pythonProcess.StandardInput.BaseStream.Write(dataToSend, 0, dataToSend.Length);
+                            pythonProcess.StandardInput.BaseStream.Flush();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"Processing Error: {ex.Message}");
+                    }
+                }
+                else
+                {
+                    Thread.Sleep(1); // Prevent CPU spin
+                }
             }
         }
 
         private void ReadPythonOutput()
         {
-            try
+            while (threadRunning && pythonProcess != null && !pythonProcess.HasExited)
             {
-                while (threadRunning && pythonProcess != null && !pythonProcess.HasExited)
+                try
                 {
                     string line = pythonProcess.StandardOutput.ReadLine();
                     if (line == null) break;
-
-                    if (line.StartsWith("KEYS:"))
-                    {
-                        string keys = line.Substring(5); // Remove "KEYS:"
-                        lastKeysPressed = keys;
-
-                        if (!string.IsNullOrEmpty(keys))
-                        {
-                            Log($"AI pressed: {keys}");
-                        }
-                    }
-                    else if (line.StartsWith("ERROR:"))
-                    {
-                        Log($"Python error: {line.Substring(6)}");
-                    }
-                    else if (line == "QUIT_OK")
-                    {
-                        Log("Python acknowledged quit");
-                        break;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"Reader thread error: {ex.Message}");
+                    if (line.StartsWith("KEYS:")) 
+                    { 
+                        Log(line); 
+                        waitingForPrediction = false; // Python is ready for more!
+                    } 
+                    else if (line.StartsWith("ERROR:")) Log($"PyErr: {line}");
+                } catch { break; }
             }
         }
 
-        private Texture2D CaptureScreen()
+        // --- Helper Methods for Enemy Detection ---
+        private GameObject FindCurrentEnemy()
         {
             try
             {
-                int screenWidth = Screen.width;
-                int screenHeight = Screen.height;
+                var healthManagers = GameObject.FindObjectsOfType<HealthManager>();
+                if (healthManagers.Length == 0) return null;
 
-                // Capture full screen
-                Texture2D fullScreenshot = new Texture2D(screenWidth, screenHeight, TextureFormat.RGB24, false);
-                fullScreenshot.ReadPixels(new Rect(0, 0, screenWidth, screenHeight), 0, 0);
-                fullScreenshot.Apply();
-
-                // Scale down
-                RenderTexture rt = RenderTexture.GetTemporary(targetWidth, targetHeight);
-                Graphics.Blit(fullScreenshot, rt);
-
-                Texture2D scaledScreenshot = new Texture2D(targetWidth, targetHeight, TextureFormat.RGB24, false);
-                RenderTexture.active = rt;
-                scaledScreenshot.ReadPixels(new Rect(0, 0, targetWidth, targetHeight), 0, 0);
-                scaledScreenshot.Apply();
-                RenderTexture.active = null;
-
-                UnityEngine.Object.Destroy(fullScreenshot);
-                RenderTexture.ReleaseTemporary(rt);
-
-                return scaledScreenshot;
+                return FindClosestEnemyToPlayer(healthManagers);
             }
-            catch (Exception ex)
+            catch
             {
-                Log($"Capture error: {ex.Message}");
                 return null;
             }
         }
 
-        private byte[] ConvertToGrayscale(Texture2D texture)
+        private GameObject FindClosestEnemyToPlayer(HealthManager[] healthManagers)
         {
-            Color[] pixels = texture.GetPixels();
-            byte[] grayscaleBytes = new byte[targetWidth * targetHeight];
+            var hero = HeroController.instance;
+            Vector3 heroPos = hero?.transform.position ?? Vector3.zero;
 
-            for (int i = 0; i < pixels.Length; i++)
+            HealthManager closest = null;
+            float minDistance = float.MaxValue;
+
+            foreach (var healthManager in healthManagers)
             {
-                float gray = pixels[i].r * 0.299f + pixels[i].g * 0.587f + pixels[i].b * 0.114f;
-                grayscaleBytes[i] = (byte)(gray * 255f);
+                float distance = Vector3.Distance(heroPos, healthManager.transform.position);
+                if (distance < minDistance)
+                {
+                    minDistance = distance;
+                    closest = healthManager;
+                }
             }
 
-            return grayscaleBytes;
+            return closest?.gameObject;
         }
 
         public void Unload()
         {
-            Log("Mod unloading - ensuring AI is stopped");
             isAIActive = false;
-            StopPythonProcess();
+            StopPythonProcess(); 
+            CleanupTextures();
             ModHooks.HeroUpdateHook -= OnHeroUpdate;
         }
     }
