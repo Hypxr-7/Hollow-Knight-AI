@@ -3,6 +3,7 @@ import os
 import json
 import random
 import warnings
+import datetime
 
 # Third-party imports
 import pandas as pd
@@ -14,18 +15,44 @@ from tqdm import tqdm
 
 # Scikit-learn imports
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_recall_curve
 
 # PyTorch imports
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import torchvision.transforms as transforms
-
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+import torch.cuda.amp as amp
 
 # Warnings configuration
 warnings.filterwarnings('ignore')
+
+def engineer_features(df):
+    """
+    Adds derived features to the dataframe.
+    Assumes df contains a single contiguous session or is carefully handled.
+    """
+    # 1. Deltas (Velocity)
+    df['player_dx'] = df['x_position'].diff().fillna(0)
+    df['player_dy'] = df['y_position'].diff().fillna(0)
+    df['enemy_dx'] = df['enemy_x'].diff().fillna(0)
+    df['enemy_dy'] = df['enemy_y'].diff().fillna(0)
+    
+    # 2. Speed (Magnitude)
+    df['player_speed'] = np.sqrt(df['player_dx']**2 + df['player_dy']**2)
+    
+    # 3. Euclidean Distance to Enemy
+    df['enemy_distance'] = np.sqrt((df['x_position'] - df['enemy_x'])**2 + (df['y_position'] - df['enemy_y'])**2)
+    
+    # 4. Previous Actions
+    action_cols = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
+    for col in action_cols:
+        df[f'prev_{col}'] = df[col].shift(1).fillna(0)
+        
+    return df
 
 class HollowKnightDataset(Dataset):
     """
@@ -33,22 +60,29 @@ class HollowKnightDataset(Dataset):
     Prepares image and positional data for the CNN model.
     Supports frame stacking for temporal context.
     """
-    def __init__(self, data_df, transform=None, image_size=(80, 60), n_frames=1):
+    def __init__(self, data_df, transform=None, image_size=(80, 60), n_frames=1, feature_columns=None):
         self.data = data_df.copy() # Use a copy to avoid SettingWithCopyWarning
         self.transform = transform
         self.image_size = image_size
         self.n_frames = n_frames
         self.action_columns = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
         
+        # Default features if none provided (for backward compatibility)
+        if feature_columns is None:
+            self.feature_columns = ['x_position', 'y_position', 'enemy_x', 'enemy_y']
+        else:
+            self.feature_columns = feature_columns
+            
+        # Verify features exist
+        missing_cols = [c for c in self.feature_columns if c not in self.data.columns]
+        if missing_cols:
+            raise ValueError(f"Missing feature columns in dataframe: {missing_cols}")
+        
         # Filter valid frames
         self.data = self.data[self.data['frame_path'].apply(os.path.exists)].reset_index(drop=True)
 
         if not self.image_size:
             self.image_size = self._get_original_image_size()
-
-        print(f"Dataset loaded: {len(self.data)} samples")
-        print(f"Image size: {self.image_size}")
-        print(f"Frame Stacking: {self.n_frames} frames")
         
     def _get_original_image_size(self):
         if len(self.data) > 0:
@@ -59,8 +93,6 @@ class HollowKnightDataset(Dataset):
         return None
 
     def _get_previous_frame_path(self, current_path, current_id, offset):
-        # Reconstruct path for frame_id - offset
-        # Assumes format: .../frame_XXXXXX.png
         dir_name = os.path.dirname(current_path)
         prev_id = current_id - offset
         return os.path.join(dir_name, f"frame_{prev_id:06d}.png")
@@ -75,48 +107,31 @@ class HollowKnightDataset(Dataset):
         
         frames = []
         
-        # Load sequence of frames (newest to oldest or oldest to newest?)
-        # Standard convention: Channels [0..N] correspond to [t, t-1, t-2...] (newest first)
-        # or [t-(N-1), ..., t] (oldest first).
-        # Let's do [t, t-1, t-2...] so Channel 0 is always the current frame.
-        
         for i in range(self.n_frames):
             if i == 0:
                 path = current_frame_path
             else:
                 path = self._get_previous_frame_path(current_frame_path, current_frame_id, i)
             
-            # Load and process image
             if os.path.exists(path):
                 with Image.open(path).convert('L') as img:
                     if self.image_size:
                         img = img.resize(self.image_size, Image.Resampling.LANCZOS)
-                    # Convert to tensor immediately (1, H, W)
                     img_tensor = transforms.ToTensor()(img)
                     frames.append(img_tensor)
             else:
-                # Padding: Duplicate the last successfully loaded frame
-                # If even the current frame is missing (unlikely due to filter), we have a problem.
                 if frames:
                     frames.append(frames[-1])
                 else:
-                    # Fallback for current frame if filesystem changed
                     frames.append(torch.zeros(1, self.image_size[1], self.image_size[0]))
 
-        # Stack frames along channel dimension: (N_frames, H, W)
         image_stack = torch.cat(frames, dim=0)
         
-        # Apply transforms if any (must support multi-channel tensor)
         if self.transform:
             image_stack = self.transform(image_stack)
 
-        # Other features
-        other_features = torch.FloatTensor([
-            row['x_position'] / 1920.0,
-            row['y_position'] / 1080.0,
-            row['enemy_x'] / 1920.0,
-            row['enemy_y'] / 1080.0
-        ])
+        # Dynamic feature extraction
+        other_features = torch.FloatTensor([float(row[col]) for col in self.feature_columns])
         
         actions = torch.FloatTensor([float(row[col]) for col in self.action_columns])
         
@@ -131,8 +146,6 @@ class BehavioralCloningNet(nn.Module):
     def __init__(self, image_shape=(1, 60, 80), other_features_dim=4, num_actions=5, dropout_rate=0.5):
         super(BehavioralCloningNet, self).__init__()
         
-        # Convolutional layers for image processing
-        # in_channels comes from image_shape[0] (which is n_frames)
         self.conv1 = nn.Conv2d(in_channels=image_shape[0], out_channels=32, kernel_size=5, padding=2)
         self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
@@ -148,7 +161,7 @@ class BehavioralCloningNet(nn.Module):
 
     def _get_conv_out_shape(self, shape):
         with torch.no_grad():
-            dummy_tensor = torch.zeros(1, *shape) # (N, C, H, W)
+            dummy_tensor = torch.zeros(1, *shape)
             x = self.pool(F.relu(self.bn1(self.conv1(dummy_tensor))))
             x = self.pool(F.relu(self.bn2(self.conv2(x))))
             return int(np.prod(x.shape))
@@ -179,10 +192,12 @@ class FocalLoss(nn.Module):
 
 
 class BehavioralCloningTrainer:
-    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu', log_dir=None):
         self.model = model
         self.device = device
         self.model.to(device)
+        self.writer = SummaryWriter(log_dir=log_dir) if log_dir else None
+        self.scaler = amp.GradScaler() # For Mixed Precision
         self.reset_history()
 
     def reset_history(self):
@@ -204,22 +219,27 @@ class BehavioralCloningTrainer:
         action_correct = torch.zeros(5, device=self.device)
         action_total = torch.zeros(5, device=self.device)
         
+        all_labels = []
+        all_preds = []
+
         with torch.no_grad():
             for images, other_features, actions in val_loader:
                 images, other_features, actions = images.to(self.device), other_features.to(self.device), actions.to(self.device)
-                outputs = self.model(images, other_features)
                 
-                loss = criterion(outputs, actions)
+                with amp.autocast(enabled=True):
+                    outputs = self.model(images, other_features)
+                    loss = criterion(outputs, actions)
+                
                 val_loss += loss.item()
                 
-                predicted = (torch.sigmoid(outputs) > 0.5).float()
-                
-                # Exact match (all 5 actions correct)
+                # Store for threshold finding
+                probs = torch.sigmoid(outputs)
+                all_labels.append(actions.cpu())
+                all_preds.append(probs.cpu())
+
+                predicted = (probs > 0.5).float() # Default 0.5 for logging progress
                 exact_matches += (predicted == actions).all(dim=1).sum().item()
-                
-                # Partial match (count total correct individual bits)
                 total_correct_bits += (predicted == actions).sum().item()
-                
                 total_samples += actions.size(0)
                 
                 for i in range(5):
@@ -228,11 +248,38 @@ class BehavioralCloningTrainer:
         
         avg_val_loss = val_loss / len(val_loader)
         exact_match_accuracy = exact_matches / total_samples
-        partial_match_accuracy = total_correct_bits / (total_samples * 5) # 5 actions
+        partial_match_accuracy = total_correct_bits / (total_samples * 5)
         per_action_acc = [corr.item() / total.item() if total.item() > 0 else 0 for corr, total in zip(action_correct, action_total)]
         
-        return avg_val_loss, exact_match_accuracy, partial_match_accuracy, per_action_acc
+        # Concatenate for global metrics
+        all_labels = torch.cat(all_labels).numpy()
+        all_preds = torch.cat(all_preds).numpy()
+        
+        return avg_val_loss, exact_match_accuracy, partial_match_accuracy, per_action_acc, all_labels, all_preds
     
+    def find_optimal_thresholds(self, labels, preds, action_names):
+        """Finds the best threshold for each action to maximize F1 Score."""
+        thresholds = {}
+        print("\n--- Optimal Threshold Search (Max F1 Score) ---")
+        
+        for i, action in enumerate(action_names):
+            precision, recall, thresh = precision_recall_curve(labels[:, i], preds[:, i])
+            
+            # Calculate F1 for each threshold
+            f1_scores = 2 * (precision * recall) / (precision + recall + 1e-10)
+            best_idx = np.argmax(f1_scores)
+            
+            # precision_recall_curve returns thresholds with length = len(precision) - 1
+            if best_idx < len(thresh):
+                best_threshold = thresh[best_idx]
+            else:
+                best_threshold = 0.5 # Default fallback
+            
+            thresholds[action] = float(best_threshold)
+            print(f"{action}: {best_threshold:.4f} (F1: {f1_scores[best_idx]:.4f})")
+            
+        return thresholds
+
     def plot_training_history(self, save_path='training_history.png'):
         if not self.train_losses: return
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
@@ -268,11 +315,10 @@ class BehavioralCloningTrainer:
         plt.tight_layout()
         plt.savefig(save_path, dpi=300)
         plt.close(fig)
-        print(f"Training history plot saved as '{save_path}'")
 
     def train(self, train_loader, val_loader, epochs, learning_rate, weight_decay, loss_type):
         self.reset_history()
-        self.partial_accuracies = [] # Store partial accuracies for plotting
+        self.partial_accuracies = []
         
         pos_weights = []
         for i, col in enumerate(train_loader.dataset.action_columns):
@@ -285,34 +331,61 @@ class BehavioralCloningTrainer:
         optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
         
-        print(f"\nTraining on {self.device} with {loss_type.upper()} loss...")
+        print(f"\nTraining on {self.device} with {loss_type.upper()} loss (Mixed Precision Enabled)...")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
         best_val_loss = float('inf')
         patience_counter, patience = 0, 15
+        
+        global_step = 0
+        
+        # Placeholders for best model's stats
+        best_labels = None
+        best_preds = None
 
         for epoch in range(epochs):
             self.model.train()
             train_loss = 0
             
-            for images, other_features, actions in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+            for images, other_features, actions in pbar:
                 images, other_features, actions = images.to(self.device), other_features.to(self.device), actions.to(self.device)
                 optimizer.zero_grad()
-                outputs = self.model(images, other_features)
-                loss = criterion(outputs, actions)
-                loss.backward()
+                
+                with amp.autocast(enabled=True):
+                    outputs = self.model(images, other_features)
+                    loss = criterion(outputs, actions)
+                
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                optimizer.step()
+                self.scaler.step(optimizer)
+                self.scaler.update()
+                
                 train_loss += loss.item()
-            
+                global_step += 1
+                
+                if self.writer:
+                    self.writer.add_scalar('Loss/batch_train', loss.item(), global_step)
+
             avg_train_loss = train_loss / len(train_loader)
-            val_loss, val_accuracy, partial_accuracy, per_action_acc = self.validate(val_loader, criterion)
+            val_loss, val_accuracy, partial_accuracy, per_action_acc, val_labels, val_preds = self.validate(val_loader, criterion)
             scheduler.step(val_loss)
             
+            if self.writer:
+                self.writer.add_scalar('Loss/epoch_train', avg_train_loss, epoch)
+                self.writer.add_scalar('Loss/epoch_val', val_loss, epoch)
+                self.writer.add_scalar('Accuracy/exact_match', val_accuracy, epoch)
+                self.writer.add_scalar('Accuracy/partial_match', partial_accuracy, epoch)
+                for i, name in enumerate(['Left', 'Right', 'Attack', 'Jump', 'Dash']):
+                    self.writer.add_scalar(f'Accuracy_Per_Action/{name}', per_action_acc[i], epoch)
+
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
                 self.save_checkpoint('best_model.pth')
+                best_labels = val_labels
+                best_preds = val_preds
             else:
                 patience_counter += 1
             
@@ -329,21 +402,30 @@ class BehavioralCloningTrainer:
                 print(f"Early stopping after {epoch+1} epochs.")
                 break
         
+        if self.writer:
+            self.writer.close()
+            
         self.load_checkpoint('best_model.pth')
         print("Training completed!")
-        return best_val_loss, self.per_action_accuracies[-1] if self.per_action_accuracies else [0]*5
+        
+        # Calculate optimal thresholds for the best model
+        optimal_thresholds = self.find_optimal_thresholds(best_labels, best_preds, train_loader.dataset.action_columns)
+        
+        return best_val_loss, self.per_action_accuracies[-1] if self.per_action_accuracies else [0]*5, optimal_thresholds
 
-def export_model_for_inference(model, image_size, n_frames, output_dir='model'):
+def export_model_for_inference(model, image_size, n_frames, feature_columns, thresholds, output_dir='model'):
     os.makedirs(output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(output_dir, 'model.pth'))
     
     model_info = {
         'model_class': model.__class__.__name__,
-        'image_shape': [n_frames, image_size[1], image_size[0]], # C, H, W (C is stack size)
-        'other_features_dim': 4,
+        'image_shape': [n_frames, image_size[1], image_size[0]],
+        'other_features_dim': len(feature_columns),
+        'feature_columns': feature_columns,
         'num_actions': 5,
         'action_columns': ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing'],
-        'n_frames': n_frames
+        'n_frames': n_frames,
+        'thresholds': thresholds # Save the learned thresholds
     }
     with open(os.path.join(output_dir, 'model_info.json'), 'w') as f:
         json.dump(model_info, f, indent=2)
@@ -351,9 +433,6 @@ def export_model_for_inference(model, image_size, n_frames, output_dir='model'):
     print(f"Model exported to {output_dir}/")
 
 def load_model_for_inference(model_dir='model'):
-    """
-    Loads a CNN model and its metadata for inference.
-    """
     model_info_path = os.path.join(model_dir, 'model_info.json')
     if not os.path.exists(model_info_path):
         raise FileNotFoundError(f"model_info.json not found in {model_dir}")
@@ -361,19 +440,23 @@ def load_model_for_inference(model_dir='model'):
     with open(model_info_path, 'r') as f:
         model_info = json.load(f)
 
-    # Handle legacy models without n_frames
     n_frames = model_info.get('n_frames', 1)
+    
+    # Handle backward compatibility
+    feature_columns = model_info.get('feature_columns', ['x_position', 'y_position', 'enemy_x', 'enemy_y'])
+    other_features_dim = model_info.get('other_features_dim', 4)
 
     model = BehavioralCloningNet(
         image_shape=tuple(model_info['image_shape']),
-        other_features_dim=model_info['other_features_dim'],
+        other_features_dim=other_features_dim,
         num_actions=model_info['num_actions']
     )
     
-    # Load weights
     weights_path = os.path.join(model_dir, 'model.pth')
     model.load_state_dict(torch.load(weights_path, map_location=torch.device('cpu')))
     model.eval()
+    
+    model_info['feature_columns'] = feature_columns
     
     return model, model_info
 
@@ -382,11 +465,14 @@ def main():
     # --- Configuration ---
     DATA_DIR = r"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\HKData"
     TRAIN_ON_ALL_DATA = True
-    ENABLE_DATA_AUGMENTATION = False # Disabled for now 
     NUM_MODELS_TO_FIND = 3
     MAX_TRIALS = 100
     MIN_ACTION_ACCURACY = 0.5
-    STACK_SIZE = 3 # Number of frames to stack
+    STACK_SIZE = 3 
+    
+    # TensorBoard Logs
+    BASE_LOG_DIR = os.path.join("runs", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(BASE_LOG_DIR, exist_ok=True)
 
     # --- Data Loading ---
     csv_files = [f for f in os.listdir(DATA_DIR) if f.startswith('hk_actions_') and f.endswith('.csv')]
@@ -402,43 +488,45 @@ def main():
         data_to_load.append(max(csv_files))
 
     all_dfs = []
-    for csv_file in data_to_load:
+    print("Loading and Preprocessing Data...")
+    for csv_file in tqdm(data_to_load, desc="Processing Sessions"):
         session_id = csv_file.replace('hk_actions_', '').replace('.csv', '')
         frames_dir = os.path.join(DATA_DIR, f'frames_{session_id}')
         if os.path.exists(frames_dir):
             df = pd.read_csv(os.path.join(DATA_DIR, csv_file))
             df['frame_path'] = df['frame_id'].apply(lambda x: os.path.join(frames_dir, f"frame_{x:06d}.png"))
+            
+            # Feature Engineering per Session
+            df = engineer_features(df)
+            
             all_dfs.append(df)
     
     if not all_dfs: print("No data could be loaded. Exiting."); return
     master_df = pd.concat(all_dfs, ignore_index=True)
     if len(master_df) == 0: print("No valid data in master DataFrame. Exiting."); return
 
-
-    # Data Augmentation (Modified for Stacked Tensors)
-    # Note: ToTensor() is handled by dataset now.
-    if ENABLE_DATA_AUGMENTATION:
-        train_transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomAffine(degrees=5, translate=(0.05, 0.05)),
-            # Removed ColorJitter to avoid issues with >3 channels
-        ])
-    else:
-        train_transform = None
-
-    val_transform = None # Dataset handles basic loading
+    # Define Feature Columns
+    feature_columns = [
+        'x_position', 'y_position', 'enemy_x', 'enemy_y', # Original
+        'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy', # Deltas
+        'player_speed', 'enemy_distance',                 # Derived
+        'prev_moving_left', 'prev_moving_right', 'prev_attacking', 'prev_jumping', 'prev_dashing' # History
+    ]
+    
+    print(f"Using {len(feature_columns)} extra features: {feature_columns}")
 
     # --- Ensemble Training via Filter and Collect ---
     print(f"\n--- Searching for {NUM_MODELS_TO_FIND} 'Good' Models (Min Action Accuracy > {MIN_ACTION_ACCURACY}) ---")
     print(f"Frame Stacking: {STACK_SIZE}")
+    print(f"TensorBoard Logs: {BASE_LOG_DIR}")
     
     search_space = {
         'learning_rate': [5e-5, 1e-4, 5e-4],
         'dropout_rate': [0.3, 0.4, 0.5],
         'weight_decay': [1e-5, 1e-4, 5e-4],
         'loss_type': ['bce', 'focal'],
-        'image_size': [(160, 90),(320,160)],#(80,40), removed for now
-        'batch_size': [32, 64]
+        'image_size': [(640,360), (320,180)],
+        'batch_size': [32,48,64,94]
     }
     
     saved_models_count = 0
@@ -455,35 +543,66 @@ def main():
         # Split dataframes for this trial
         train_df, val_df = train_test_split(master_df, test_size=0.2, random_state=42)
 
-        # Create datasets
+        # --- Imbalance Handling: Weighted Random Sampler ---
+        action_columns = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
+        class_counts = train_df[action_columns].sum().replace(0, 1) 
+        class_weights_series = len(train_df) / class_counts
+        
+        sample_weights = train_df[action_columns].mul(class_weights_series).sum(axis=1)
+        is_idle = (train_df[action_columns] == 0).all(axis=1)
+        idle_count = is_idle.sum()
+        idle_weight = len(train_df) / idle_count if idle_count > 0 else 1.0
+        sample_weights[is_idle] = idle_weight
+        
+        sampler = WeightedRandomSampler(
+            weights=sample_weights.values,
+            num_samples=len(train_df),
+            replacement=True
+        )
+
+        # Create datasets with Feature Columns
         train_trial_dataset = HollowKnightDataset(
             data_df=train_df,
             image_size=hp['image_size'],
-            transform=train_transform,
-            n_frames=STACK_SIZE
+            transform=None,
+            n_frames=STACK_SIZE,
+            feature_columns=feature_columns
         )
         val_trial_dataset = HollowKnightDataset(
             data_df=val_df,
             image_size=hp['image_size'],
-            transform=val_transform,
-            n_frames=STACK_SIZE
+            transform=None, 
+            n_frames=STACK_SIZE,
+            feature_columns=feature_columns
         )
         
         if len(train_trial_dataset) == 0:
             print(f"Skipping trial {trial+1}: Not enough data.")
             continue
             
-        train_loader = DataLoader(train_trial_dataset, batch_size=hp['batch_size'], shuffle=True)
-        val_loader = DataLoader(val_trial_dataset, batch_size=hp['batch_size'], shuffle=False)
+        train_loader = DataLoader(
+            train_trial_dataset, 
+            batch_size=hp['batch_size'], 
+            sampler=sampler, 
+            shuffle=False 
+        )
+        val_loader = DataLoader(
+            val_trial_dataset, 
+            batch_size=hp['batch_size'], 
+            shuffle=False
+        )
         
-        # Initialize model with stack size as channels
+        # Initialize model with Correct Feature Dim
         model = BehavioralCloningNet(
             image_shape=(STACK_SIZE, hp['image_size'][1], hp['image_size'][0]), 
+            other_features_dim=len(feature_columns),
             dropout_rate=hp['dropout_rate']
         )
         
-        trainer = BehavioralCloningTrainer(model)
-        _, final_accuracies = trainer.train(
+        trial_log_dir = os.path.join(BASE_LOG_DIR, f"trial_{trial+1}")
+        
+        trainer = BehavioralCloningTrainer(model, log_dir=trial_log_dir)
+        _, final_accuracies, optimal_thresholds = trainer.train(
             train_loader, val_loader, epochs=100,
             learning_rate=hp['learning_rate'], 
             weight_decay=hp['weight_decay'],
@@ -495,7 +614,7 @@ def main():
             saved_models_count += 1
             print(f"\nSUCCESS! Model passed quality check. Saving as ensemble member #{saved_models_count}.")
             output_dir = f"model/ensemble_{saved_models_count}"
-            export_model_for_inference(model, hp['image_size'], STACK_SIZE, output_dir=output_dir)
+            export_model_for_inference(model, hp['image_size'], STACK_SIZE, feature_columns, optimal_thresholds, output_dir=output_dir)
             trainer.plot_training_history(save_path=os.path.join(output_dir, 'training_history.png'))
             # Save hyperparameters
             with open(os.path.join(output_dir, 'hyperparameters.json'), 'w') as f:
@@ -510,5 +629,4 @@ def main():
         os.remove('best_model.pth')
 
 if __name__ == "__main__":
-    import torch.nn.functional as F
     main()

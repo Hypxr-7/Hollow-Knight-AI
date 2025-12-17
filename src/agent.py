@@ -14,7 +14,7 @@ from train import BehavioralCloningNet, load_model_for_inference
 class EnsembleAgent:
     """
     An agent that uses an ensemble of CNN models to make predictions.
-    Supports frame stacking for temporal context.
+    Supports frame stacking and stateful feature engineering.
     """
     def __init__(self, model_base_dir='model'):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -34,7 +34,7 @@ class EnsembleAgent:
 
         print(f"Found {len(ensemble_dirs)} models in the ensemble.", file=sys.stderr)
 
-        # Load models and determine maximum frame history needed
+        # Load models and determine requirements
         self.max_frames_needed = 1
         
         for model_dir in ensemble_dirs:
@@ -43,7 +43,6 @@ class EnsembleAgent:
             model.to(self.device)
             self.models_with_info.append((model, info))
             
-            # Check how many frames this model expects
             n_frames = info.get('n_frames', 1)
             if 'image_shape' in info and len(info['image_shape']) == 3:
                 n_frames = max(n_frames, info['image_shape'][0])
@@ -52,6 +51,16 @@ class EnsembleAgent:
         
         # Buffer to store the last N raw frames
         self.frame_history = deque(maxlen=self.max_frames_needed)
+        
+        # State tracking for feature engineering
+        self.last_player_x = None
+        self.last_player_y = None
+        self.last_enemy_x = None
+        self.last_enemy_y = None
+        self.prev_actions = {
+            'moving_left': 0.0, 'moving_right': 0.0, 
+            'attacking': 0.0, 'jumping': 0.0, 'dashing': 0.0
+        }
         
         self.action_columns = self.models_with_info[0][1]['action_columns']
 
@@ -66,46 +75,80 @@ class EnsembleAgent:
         
         print(f"Ensemble loaded with {len(self.models_with_info)} models. Max history: {self.max_frames_needed} frames.")
 
-    def predict_from_bytes(self, image_bytes, width, height, player_x=0.5, player_y=0.5, enemy_x=0.0, enemy_y=0.0):
+    def _engineer_features_inference(self, player_x, player_y, enemy_x, enemy_y):
+        """
+        Replicates the logic from train.py's engineer_features function in a stateful way.
+        """
+        # Initialize previous state on first frame
+        if self.last_player_x is None:
+            self.last_player_x = player_x
+            self.last_player_y = player_y
+            self.last_enemy_x = enemy_x
+            self.last_enemy_y = enemy_y
+
+        # 1. Deltas
+        player_dx = player_x - self.last_player_x
+        player_dy = player_y - self.last_player_y
+        enemy_dx = enemy_x - self.last_enemy_x
+        enemy_dy = enemy_y - self.last_enemy_y
+        
+        # 2. Speed
+        player_speed = np.sqrt(player_dx**2 + player_dy**2)
+        
+        # 3. Distance
+        enemy_distance = np.sqrt((player_x - enemy_x)**2 + (player_y - enemy_y)**2)
+        
+        # Update state for next frame
+        self.last_player_x = player_x
+        self.last_player_y = player_y
+        self.last_enemy_x = enemy_x
+        self.last_enemy_y = enemy_y
+        
+        # 4. Previous Actions 
+        # Order must match train.py:
+        # ['x_position', 'y_position', 'enemy_x', 'enemy_y', 
+        #  'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
+        #  'player_speed', 'enemy_distance',
+        #  'prev_moving_left', 'prev_moving_right', 'prev_attacking', 'prev_jumping', 'prev_dashing']
+        
+        features = [
+            player_x, player_y, enemy_x, enemy_y,
+            player_dx, player_dy, enemy_dx, enemy_dy,
+            player_speed, enemy_distance,
+            self.prev_actions['moving_left'], self.prev_actions['moving_right'],
+            self.prev_actions['attacking'], self.prev_actions['jumping'], self.prev_actions['dashing']
+        ]
+        
+        return torch.FloatTensor(features).unsqueeze(0).to(self.device)
+
+    def predict_from_bytes(self, image_bytes, width, height, player_x, player_y, enemy_x, enemy_y):
         try:
             # --- Preprocessing for CNN ---
             # Decode raw bytes to numpy array (H, W, 3) - RGB
             image_np = np.frombuffer(image_bytes, dtype=np.uint8).reshape((height, width, 3))
             
-            # Convert to Grayscale (match training pipeline)
-            # Training uses PIL .convert('L'), which is consistent with cv2.COLOR_RGB2GRAY
+            # Convert to Grayscale
             gray_frame = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-            
-            # DEBUG: Check raw image stats
-            raw_mean = np.mean(gray_frame)
-            raw_std = np.std(gray_frame)
-            
-            if not hasattr(self, '_stats_logged'):
-                print(f"DEBUG RAW IMAGE: shape={gray_frame.shape}, mean={raw_mean:.1f}, std={raw_std:.1f}", file=sys.stderr)
-                self._stats_logged = True
-            
-            # NO FLIP - Unity's ReadPixels + RenderTexture already gives correct orientation
             frame_to_use = gray_frame
             
-            # Save debug image on first frame
-            if not hasattr(self, '_debug_saved'):
-                cv2.imwrite('debug_inference_frame.png', frame_to_use)
-                print(f"DEBUG: Saved debug_inference_frame.png (compare with training data)", file=sys.stderr)
-                self._debug_saved = True
-
-            # Update Frame History with full-res frames (640x360)
-            # Models will resize as needed
+            # Update Frame History
             self.frame_history.append(frame_to_use)
 
-            other_features = torch.FloatTensor([
-                player_x, player_y, enemy_x, enemy_y
-            ]).unsqueeze(0).to(self.device)
+            # --- Feature Engineering ---
+            # Check what features the first model expects
+            required_features = self.models_with_info[0][1].get('feature_columns', ['x_position', 'y_position', 'enemy_x', 'enemy_y'])
+            
+            if len(required_features) > 4:
+                # Use full engineered features with RAW coordinates
+                other_features = self._engineer_features_inference(player_x, player_y, enemy_x, enemy_y)
+            else:
+                # Fallback for legacy models
+                other_features = torch.FloatTensor([player_x, player_y, enemy_x, enemy_y]).unsqueeze(0).to(self.device)
 
             # --- Ensemble Prediction ---
             all_logits = []
             with torch.no_grad():
                 for model, info in self.models_with_info:
-                    # Determine model-specific requirements
                     target_n_frames = info.get('n_frames', 1)
                     if 'image_shape' in info and len(info['image_shape']) == 3:
                         target_n_frames = max(target_n_frames, info['image_shape'][0])
@@ -113,51 +156,40 @@ class EnsembleAgent:
                     target_h = info['image_shape'][1]
                     target_w = info['image_shape'][2]
                     
-                    # Prepare the stack of frames for this model
                     history_list = list(self.frame_history)
-                    
-                    # Pad if not enough history (duplicate oldest frame)
                     while len(history_list) < target_n_frames:
                         history_list.insert(0, history_list[0])
+                    relevant_frames = history_list[-target_n_frames:][::-1]
                     
-                    # Get last N frames
-                    relevant_frames = history_list[-target_n_frames:]
-                    
-                    # Reverse order (newest first for channel 0)
-                    relevant_frames_reversed = relevant_frames[::-1]
-                    
-                    # Resize and Stack
                     processed_frames = []
-                    for frm in relevant_frames_reversed:
-                        # Resize to model's expected input size
+                    for frm in relevant_frames:
                         if frm.shape[0] != target_h or frm.shape[1] != target_w:
                             resized = cv2.resize(frm, (target_w, target_h), interpolation=cv2.INTER_AREA)
                             processed_frames.append(resized)
                         else:
                             processed_frames.append(frm)
                     
-                    # Stack along channel dim: (N_frames, H, W)
                     stack_np = np.stack(processed_frames, axis=0)
-                    
-                    # Convert to tensor, normalize, add batch dim -> (1, N_frames, H, W)
                     image_tensor = torch.from_numpy(stack_np).float().to(self.device) / 255.0
                     image_tensor = image_tensor.unsqueeze(0)
                     
-                    # DEBUG: Log tensor stats on first prediction
-                    if not hasattr(self, '_tensor_logged'):
-                        print(f"DEBUG TENSOR: shape={image_tensor.shape}, mean={image_tensor.mean():.3f}, std={image_tensor.std():.3f}", file=sys.stderr)
-                        self._tensor_logged = True
-
-                    # Predict
                     logits = model(image_tensor, other_features)
                     all_logits.append(logits)
             
-            # Average predictions across ensemble
             avg_logits = torch.stack(all_logits).mean(dim=0)
             predictions = torch.sigmoid(avg_logits).cpu().numpy()[0]
 
+            # --- Update State for Next Frame ---
+            thresholds = {
+                'moving_left': 0.17, 'moving_right': 0.17,
+                'attacking': 0.17, 'jumping': 0.17, 'dashing': 0.17
+            }
+            
+            for i, col in enumerate(self.action_columns):
+                 self.prev_actions[col] = 1.0 if predictions[i] > thresholds.get(col, 0.5) else 0.0
+
             # --- Action Logic ---
-            active_actions = self.execute_actions(predictions)
+            active_actions = self.execute_actions(predictions, thresholds)
             return active_actions, predictions
             
         except Exception as e:
@@ -167,17 +199,12 @@ class EnsembleAgent:
             self.release_all_keys()
             return [], []
 
-    def execute_actions(self, predictions):
+    def execute_actions(self, predictions, thresholds):
         """Determine which keys to press or release based on predictions."""
         press_action_names = {'attacking', 'dashing'}
 
         desired_holds = set()
         active_actions = []
-        
-        thresholds = {
-            'moving_left': 0.17, 'moving_right': 0.17,
-            'attacking': 0.17, 'jumping': 0.17, 'dashing': 0.17
-        }
 
         for i, action in enumerate(self.action_columns):
             if predictions[i] > thresholds.get(action, 0.5):
@@ -253,16 +280,16 @@ def main():
                         pX, pY = float(parts[3]), float(parts[4])
                         eX, eY = float(parts[5]), float(parts[6])
                         
-                        # Normalize features (match training)
-                        norm_pX = pX / 1920.0
-                        norm_pY = pY / 1080.0
-                        norm_eX = eX / 1920.0
-                        norm_eY = eY / 1080.0
+                        # --- REMOVED NORMALIZATION ---
+                        # Used to be: norm_pX = pX / 1920.0
+                        # Now passing RAW values:
+                        raw_pX = pX
+                        raw_pY = pY
+                        raw_eX = eX
+                        raw_eY = eY
 
-                        # Expected size is now RGB (3 bytes per pixel)
                         expected_size = width * height * 3
                         
-                        # Read binary data
                         image_bytes = bytearray()
                         while len(image_bytes) < expected_size:
                             chunk = sys.stdin.buffer.read(expected_size - len(image_bytes))
@@ -274,15 +301,13 @@ def main():
                         
                         active_actions, predictions_array = agent.predict_from_bytes(
                             bytes(image_bytes), width, height,
-                            player_x=norm_pX, player_y=norm_pY,
-                            enemy_x=norm_eX, enemy_y=norm_eY
+                            player_x=raw_pX, player_y=raw_pY,
+                            enemy_x=raw_eX, enemy_y=raw_eY
                         )
                         dt = (time.time() - t0) * 1000
                         
-                        # Calculate image stats for logging (approximate from RGB bytes)
-                        # Just take a strided sample to avoid full copy/convert overhead for logging
                         img_arr = np.frombuffer(image_bytes, dtype=np.uint8)
-                        img_mean = np.mean(img_arr[::100]) # Sample for speed
+                        img_mean = np.mean(img_arr[::100])
                         img_std = np.std(img_arr[::100])
                         
                         action_names = agent.action_columns
