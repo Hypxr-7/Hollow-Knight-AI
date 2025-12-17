@@ -35,6 +35,10 @@ def engineer_features(df):
     Adds derived features to the dataframe.
     Assumes df contains a single contiguous session or is carefully handled.
     """
+    # Handle missing enemy data (if 0,0 represents missing)
+    # If enemy coordinates are exactly 0.0, 0.0, we might want to treat distance as "large" or "0"?
+    # For now, we compute as is, but you can mask it if needed.
+    
     # 1. Deltas (Velocity)
     df['player_dx'] = df['x_position'].diff().fillna(0)
     df['player_dy'] = df['y_position'].diff().fillna(0)
@@ -61,7 +65,7 @@ class HollowKnightDataset(Dataset):
     Supports frame stacking for temporal context.
     """
     def __init__(self, data_df, transform=None, image_size=(80, 60), n_frames=1, feature_columns=None):
-        self.data = data_df.copy() # Use a copy to avoid SettingWithCopyWarning
+        self.data = data_df.copy().reset_index(drop=True) # Reset index to align with 0..N-1 access
         self.transform = transform
         self.image_size = image_size
         self.n_frames = n_frames
@@ -78,8 +82,7 @@ class HollowKnightDataset(Dataset):
         if missing_cols:
             raise ValueError(f"Missing feature columns in dataframe: {missing_cols}")
         
-        # Filter valid frames
-        self.data = self.data[self.data['frame_path'].apply(os.path.exists)].reset_index(drop=True)
+        # Note: Filtering is now done externally before passing data_df to ensure sampler sync
 
         if not self.image_size:
             self.image_size = self._get_original_image_size()
@@ -252,14 +255,20 @@ class BehavioralCloningTrainer:
         per_action_acc = [corr.item() / total.item() if total.item() > 0 else 0 for corr, total in zip(action_correct, action_total)]
         
         # Concatenate for global metrics
-        all_labels = torch.cat(all_labels).numpy()
-        all_preds = torch.cat(all_preds).numpy()
+        if len(all_labels) > 0:
+            all_labels = torch.cat(all_labels).numpy()
+            all_preds = torch.cat(all_preds).numpy()
+        else:
+            all_labels = np.array([])
+            all_preds = np.array([])
         
         return avg_val_loss, exact_match_accuracy, partial_match_accuracy, per_action_acc, all_labels, all_preds
     
     def find_optimal_thresholds(self, labels, preds, action_names):
         """Finds the best threshold for each action to maximize F1 Score."""
         thresholds = {}
+        if len(labels) == 0: return {a: 0.5 for a in action_names}
+
         print("\n--- Optimal Threshold Search (Max F1 Score) ---")
         
         for i, action in enumerate(action_names):
@@ -339,7 +348,6 @@ class BehavioralCloningTrainer:
         
         global_step = 0
         
-        # Placeholders for best model's stats
         best_labels = None
         best_preds = None
 
@@ -408,7 +416,6 @@ class BehavioralCloningTrainer:
         self.load_checkpoint('best_model.pth')
         print("Training completed!")
         
-        # Calculate optimal thresholds for the best model
         optimal_thresholds = self.find_optimal_thresholds(best_labels, best_preds, train_loader.dataset.action_columns)
         
         return best_val_loss, self.per_action_accuracies[-1] if self.per_action_accuracies else [0]*5, optimal_thresholds
@@ -425,7 +432,7 @@ def export_model_for_inference(model, image_size, n_frames, feature_columns, thr
         'num_actions': 5,
         'action_columns': ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing'],
         'n_frames': n_frames,
-        'thresholds': thresholds # Save the learned thresholds
+        'thresholds': thresholds
     }
     with open(os.path.join(output_dir, 'model_info.json'), 'w') as f:
         json.dump(model_info, f, indent=2)
@@ -442,7 +449,6 @@ def load_model_for_inference(model_dir='model'):
 
     n_frames = model_info.get('n_frames', 1)
     
-    # Handle backward compatibility
     feature_columns = model_info.get('feature_columns', ['x_position', 'y_position', 'enemy_x', 'enemy_y'])
     other_features_dim = model_info.get('other_features_dim', 4)
 
@@ -470,7 +476,6 @@ def main():
     MIN_ACTION_ACCURACY = 0.5
     STACK_SIZE = 3 
     
-    # TensorBoard Logs
     BASE_LOG_DIR = os.path.join("runs", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
     os.makedirs(BASE_LOG_DIR, exist_ok=True)
 
@@ -496,26 +501,26 @@ def main():
             df = pd.read_csv(os.path.join(DATA_DIR, csv_file))
             df['frame_path'] = df['frame_id'].apply(lambda x: os.path.join(frames_dir, f"frame_{x:06d}.png"))
             
-            # Feature Engineering per Session
+            # Filter missing files upfront to prevent Sampler misalignment
+            valid_mask = df['frame_path'].apply(os.path.exists)
+            df = df[valid_mask].copy()
+
             df = engineer_features(df)
-            
             all_dfs.append(df)
     
     if not all_dfs: print("No data could be loaded. Exiting."); return
     master_df = pd.concat(all_dfs, ignore_index=True)
     if len(master_df) == 0: print("No valid data in master DataFrame. Exiting."); return
 
-    # Define Feature Columns
     feature_columns = [
-        'x_position', 'y_position', 'enemy_x', 'enemy_y', # Original
-        'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy', # Deltas
-        'player_speed', 'enemy_distance',                 # Derived
-        'prev_moving_left', 'prev_moving_right', 'prev_attacking', 'prev_jumping', 'prev_dashing' # History
+        'x_position', 'y_position', 'enemy_x', 'enemy_y', 
+        'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy', 
+        'player_speed', 'enemy_distance',                 
+        'prev_moving_left', 'prev_moving_right', 'prev_attacking', 'prev_jumping', 'prev_dashing' 
     ]
     
     print(f"Using {len(feature_columns)} extra features: {feature_columns}")
 
-    # --- Ensemble Training via Filter and Collect ---
     print(f"\n--- Searching for {NUM_MODELS_TO_FIND} 'Good' Models (Min Action Accuracy > {MIN_ACTION_ACCURACY}) ---")
     print(f"Frame Stacking: {STACK_SIZE}")
     print(f"TensorBoard Logs: {BASE_LOG_DIR}")
@@ -525,8 +530,8 @@ def main():
         'dropout_rate': [0.3, 0.4, 0.5],
         'weight_decay': [1e-5, 1e-4, 5e-4],
         'loss_type': ['bce', 'focal'],
-        'image_size': [(640,360), (320,180)],
-        'batch_size': [32,48,64,94]
+        'image_size': [(640,320),(320,160)],
+        'batch_size': [32,64, 94]
     }
     
     saved_models_count = 0
@@ -540,8 +545,11 @@ def main():
         hp = {k: random.choice(v) for k, v in search_space.items()}
         print(f"Sampled Hyperparameters: {json.dumps(hp, indent=2)}")
         
-        # Split dataframes for this trial
         train_df, val_df = train_test_split(master_df, test_size=0.2, random_state=42)
+        
+        # Reset Index strictly for the sampler to align with the Dataset
+        train_df = train_df.reset_index(drop=True)
+        val_df = val_df.reset_index(drop=True)
 
         # --- Imbalance Handling: Weighted Random Sampler ---
         action_columns = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
@@ -560,7 +568,6 @@ def main():
             replacement=True
         )
 
-        # Create datasets with Feature Columns
         train_trial_dataset = HollowKnightDataset(
             data_df=train_df,
             image_size=hp['image_size'],
@@ -592,7 +599,6 @@ def main():
             shuffle=False
         )
         
-        # Initialize model with Correct Feature Dim
         model = BehavioralCloningNet(
             image_shape=(STACK_SIZE, hp['image_size'][1], hp['image_size'][0]), 
             other_features_dim=len(feature_columns),
@@ -609,14 +615,12 @@ def main():
             loss_type=hp['loss_type']
         )
         
-        # --- Quality Control Check ---
         if all(acc > MIN_ACTION_ACCURACY for acc in final_accuracies):
             saved_models_count += 1
             print(f"\nSUCCESS! Model passed quality check. Saving as ensemble member #{saved_models_count}.")
             output_dir = f"model/ensemble_{saved_models_count}"
             export_model_for_inference(model, hp['image_size'], STACK_SIZE, feature_columns, optimal_thresholds, output_dir=output_dir)
             trainer.plot_training_history(save_path=os.path.join(output_dir, 'training_history.png'))
-            # Save hyperparameters
             with open(os.path.join(output_dir, 'hyperparameters.json'), 'w') as f:
                 json.dump(hp, f, indent=2)
         else:

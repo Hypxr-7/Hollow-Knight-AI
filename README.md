@@ -1,40 +1,88 @@
-# Hollow Knight AI
+# Hollow Knight AI - Behavioral Cloning Agent
 
-An attempt at trying to create an AI-based player that attempts to defeat Hollow Knight bosses making use of Behavioural Cloning
+This project implements an AI agent that learns to play *Hollow Knight* using behavioral cloning. It captures gameplay data, trains an ensemble of Convolutional Neural Networks (CNNs), and runs an inference agent that interacts with the game in real-time.
 
-## The Mods
+## Project Structure
 
-The `mods` directly contains the required mods to gather data and allow our model to take control of the player.
+```
+Hollow-Knight-AI/
+├── mods/                   # C# Mods for Hollow Knight (API)
+│   ├── DataCollector.cs    # Records gameplay data (Screenshots + CSV)
+│   └── GameAgent.cs        # Inference Client (Captures screen -> Sends to Python)
+├── src/                    # Python Source Code
+│   ├── train.py            # Trains the behavioral cloning model (Ensemble)
+│   ├── agent.py            # Inference Server (Receives images -> Predicts actions)
+│   ├── eval.py             # Evaluates model performance and generates plots
+│   └── process_data.py     # (Optional) Converts raw recording data to PNGs
+├── HKData/                 # Dataset Directory
+│   ├── hk_actions_*.csv    # Recorded player actions & state
+│   └── frames_*/           # Recorded gameplay frames
+├── model/                  # Saved Models
+│   └── ensemble_*/         # Individual ensemble member models (weights + info)
+├── runs/                   # TensorBoard logs
+└── evaluation_results/     # Output plots from eval.py
+```
 
-Use the Hollow Knight Mods extension in Visual Studio to get started.
+## Setup
 
-More about modding can be read here: https://prashantmohta.github.io/ModdingDocs/
+1.  **Prerequisites:**
+    *   Python 3.8+
+    *   Hollow Knight (PC Version)
+    *   [Modding API](https://github.com/hk-modding/api) (Scarab or manual install)
 
-### DataCollector
+2.  **Install Python Dependencies:**
+    ```bash
+    pip install -r requirements.txt
+    pip install tensorboard  # Required for training logs
+    ```
 
-This mod is used to record player data from the game.
+3.  **Install Mods:**
+    *   Copy `mods/DataCollector.cs` and `mods/GameAgent.cs` to your Hollow Knight Mods source folder or compile them into DLLs and place them in the `Mods` directory.
 
-Make sure to set the `saveDirectory` as this will be where all the data will be stored.
+## Workflow
 
-Data Collection can be toggled by pressing the 'O' key.
+### Phase 1: Data Collection
+1.  Enable the **Data Collector** mod.
+2.  In-game, press **'O'** to start recording.
+3.  Play the game naturally (jump, attack, move).
+4.  Press **'O'** again to stop recording.
+    *   *Note:* Data is saved to `HKData/`.
 
-### GameAgent
+### Phase 2: Training
+Train the ensemble model on your collected data.
 
-This mod acts as a pipe. It runs the python process (agent) and sends the data to this program.
+```bash
+python src/train.py
+```
 
-Make sure to set the `pythonScriptPath` and `modelPath`.
+*   **Features:**
+    *   **Ensemble Learning:** Trains multiple models and keeps the best ones (default: 3).
+    *   **Frame Stacking:** Uses previous frames (default: 3) to understand motion.
+    *   **Feature Engineering:** Calculates velocity, speed, and distance features automatically.
+    *   **Imbalance Handling:** Uses `WeightedRandomSampler` and `FocalLoss` to handle rare actions.
+    *   **Mixed Precision:** Uses AMP for faster training on GPUs.
+    *   **TensorBoard:** Logs metrics to `runs/`. View with `tensorboard --logdir runs`.
 
-Also add the path to your python interpreter in `FileName`.
+### Phase 3: Evaluation (Optional)
+Analyze your model's performance on the validation set.
 
-This mod can be toggled with the 'P' key.
+```bash
+python src/eval.py
+```
+Outputs plots to `evaluation_results/`:
+*   Confusion Matrices, ROC/PR Curves.
+*   Class distributions and "Similar Image" analysis.
 
-## Machine Learning
+### Phase 4: Inference (Game Agent)
+Let the AI play the game.
 
-### Training
+1.  Start the **Game Agent** mod in Hollow Knight.
+2.  Press **'P'** in-game to toggle the AI.
+    *   The mod automatically launches `src/agent.py`.
+    *   The agent captures the screen, processes features (deltas, history), and sends key presses back to the game.
 
-The code used to train our model can be found in `train.py`. Make sure to set the `DATA_DIR` in this.
+## Key Concepts
 
-### Agent
-
-The file `agent.py` is responsible for taking the game state from the GameAgent mod and the trained model to take an action
-
+*   **Stateful Inference:** The agent tracks the previous frame's player/enemy position to calculate velocity and distance features in real-time, matching the training pipeline.
+*   **Threshold Tuning:** Training automatically finds optimal action thresholds (maximizing F1-score), which are saved in `model_info.json`. The agent uses these (or manually tuned values) to decide when to press a key.
+*   **Producer-Consumer Architecture:** The `GameAgent` mod uses a background thread to send data to Python, ensuring the game runs smoothly at 60FPS.
