@@ -16,86 +16,159 @@ import cv2
 import torch
 from torch.utils.data import DataLoader
 
-# Import the correct, up-to-date classes and functions from train.py
-from train import BehavioralCloningNet, HollowKnightDataset, load_model_for_inference
+# Import classes
+from train import BehavioralCloningNet, HollowKnightDataset, load_model_for_inference, MetaLearner
 
 warnings.filterwarnings('ignore')
 
 # --- Evaluation and Plotting Functions ---
 
-def get_predictions(models_with_info, master_df, device='cpu'):
+def get_predictions(model_base_dir, master_df, device='cpu'):
     """
-    Gets predictions from an ensemble of models, handling heterogeneous input sizes.
+    Gets predictions using the Meta-Learner ensemble architecture.
     """
-    all_model_preds = []
-    all_model_embeddings = []
+    print(f"Loading models from {model_base_dir}...")
     
-    final_labels = None
-    final_frame_ids = None
-
-    class TempEvalDataset(HollowKnightDataset):
-        def __init__(self, data_df, image_size, n_frames):
-            super().__init__(data_df=data_df, image_size=image_size, n_frames=n_frames)
-
-        def __getitem__(self, idx):
-            img, other_features, actions = super().__getitem__(idx)
-            frame_id = self.data.iloc[idx]['frame_id']
-            return img, other_features, actions, frame_id
-
-    for i, (model, info) in enumerate(models_with_info):
-        print(f"--- Processing Model {i+1}/{len(models_with_info)} ---")
+    expert_names = ['global', 'movement', 'jump_dash', 'combat']
+    experts = {}
+    max_n_frames = 1
+    total_expert_output_dim = 0
+    
+    # Load Experts
+    for name in expert_names:
+        model_dir = os.path.join(model_base_dir, f"ensemble_{name}")
+        if not os.path.exists(model_dir):
+            raise FileNotFoundError(f"Expert model not found at {model_dir}")
+            
+        model, info = load_model_for_inference(model_dir)
         model.to(device)
         model.eval()
-
-        # Handle legacy models or different shapes
+        experts[name] = {'model': model, 'info': info}
+        
+        total_expert_output_dim += len(info.get('action_columns', []))
+        
         n_frames = info.get('n_frames', 1)
         if 'image_shape' in info and len(info['image_shape']) == 3:
             n_frames = max(n_frames, info['image_shape'][0])
+        max_n_frames = max(max_n_frames, n_frames)
+
+    # Load Meta-Learner Info
+    meta_info_path = os.path.join(model_base_dir, 'meta_info.json')
+    if not os.path.exists(meta_info_path):
+            raise FileNotFoundError(f"Meta info not found at {meta_info_path}")
+    
+    with open(meta_info_path, 'r') as f:
+        meta_info = json.load(f)
+        
+    meta_features_list = meta_info.get('meta_features', [])
+    meta_input_dim = total_expert_output_dim + len(meta_features_list)
+    print(f"Meta-Learner Input Dim: {meta_input_dim} (Experts: {total_expert_output_dim} + Context: {len(meta_features_list)})")
+
+    # Load Meta-Learner
+    meta_path = os.path.join(model_base_dir, 'meta_learner.pth')
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"Meta-Learner model not found at {meta_path}")
+        
+    meta_learner = MetaLearner(input_dim=meta_input_dim, output_dim=5)
+    meta_learner.load_state_dict(torch.load(meta_path, map_location=device))
+    meta_learner.to(device)
+    meta_learner.eval()
+    
+    print(f"Models loaded. Max frames needed: {max_n_frames}")
+
+    # Prepare Dataset
+    # We load ALL features into the dataframe first
+    # This dataset returns "all available features" in a tensor, but we also need column mapping
+    target_size = experts['global']['info']['image_shape'][1:] # H, W
+    image_size = (target_size[1], target_size[0]) # W, H for PIL
+    
+    # We need a custom dataset that returns the DataFrame row or a Dict
+    # because standard HollowKnightDataset returns a fixed feature tensor.
+    # We will subclass and return the raw indices to look up in DF
+    
+    class EvalDataset(HollowKnightDataset):
+        def __getitem__(self, idx):
+            img, _, actions = super().__getitem__(idx) # Ignore standard feature tensor
+            frame_id = self.data.iloc[idx]['frame_id']
+            # Return index to look up row in master_df efficiently
+            return img, idx, actions, frame_id
+
+    # We assume master_df is already engineered with ALL columns
+    feature_columns_all = list(set([col for exp in experts.values() for col in exp['info']['feature_columns']] + meta_features_list))
+    
+    # Pass a dummy feature column list to init, we won't use the standard output
+    eval_dataset = EvalDataset(data_df=master_df.copy(), image_size=image_size, n_frames=max_n_frames, feature_columns=['x_position']) # Dummy
+    eval_loader = DataLoader(eval_dataset, batch_size=64, shuffle=False)
+
+    all_preds = []
+    all_labels = []
+    all_frame_ids = []
+    all_embeddings = [] 
+
+    # Pre-extract all features to numpy for fast lookup
+    # Rows: Samples, Cols: Features
+    # We need a map from "Feature Name" to "Column Index"
+    df_features = master_df[feature_columns_all].fillna(0.0).astype(np.float32)
+    feature_map = {name: i for i, name in enumerate(feature_columns_all)}
+    feature_matrix = df_features.values
+    feature_matrix_torch = torch.tensor(feature_matrix, device=device)
+
+    with torch.no_grad():
+        for images, indices, labels, frame_ids in tqdm(eval_loader, desc="Evaluating"):
+            images, labels = images.to(device), labels.to(device)
+            indices = indices.to(device)
             
-        target_h = info['image_shape'][1]
-        target_w = info['image_shape'][2]
-        image_size = (target_w, target_h) # PIL uses (W, H)
+            # Get the feature rows for this batch
+            batch_features_all = feature_matrix_torch[indices]
+            
+            expert_outputs = []
+            global_embedding = None
 
-        print(f"Using image size: {image_size}, n_frames: {n_frames}")
-
-        temp_dataset = TempEvalDataset(data_df=master_df.copy(), image_size=image_size, n_frames=n_frames)
-        temp_loader = DataLoader(temp_dataset, batch_size=64, shuffle=False)
-        
-        current_model_labels, current_model_preds, current_model_frame_ids, current_model_embeddings = [], [], [], []
-
-        with torch.no_grad():
-            for images, other_features, labels, frame_ids in tqdm(temp_loader, desc=f"Model {i+1} Predictions"):
-                images, other_features, labels = images.to(device), other_features.to(device), labels.to(device)
+            for name in expert_names:
+                expert = experts[name]
+                model = expert['model']
+                info = expert['info']
                 
-                # Manually run forward pass to get embeddings
-                x = model.pool(torch.nn.functional.relu(model.bn1(model.conv1(images))))
-                x = model.pool(torch.nn.functional.relu(model.bn2(model.conv2(x))))
-                x = x.view(x.size(0), -1)
-                combined = torch.cat([x, other_features], dim=1)
+                # Select specific columns for this expert
+                required_cols = info['feature_columns']
+                col_indices = [feature_map[c] for c in required_cols]
+                expert_features = batch_features_all[:, col_indices]
                 
-                # Get embedding (penultimate layer output)
-                embedding = torch.nn.functional.relu(model.bn3(model.fc1(combined)))
+                # Get embeddings from global expert for visualization
+                if name == 'global':
+                    x = model.pool(torch.nn.functional.relu(model.bn1(model.conv1(images))))
+                    x = model.pool(torch.nn.functional.relu(model.bn2(model.conv2(x))))
+                    x = x.view(x.size(0), -1)
+                    combined = torch.cat([x, expert_features], dim=1)
+                    embedding = torch.nn.functional.relu(model.bn3(model.fc1(combined)))
+                    global_embedding = embedding.cpu().numpy()
                 
-                # Get final prediction
-                output = model.fc2(model.dropout(embedding))
-                probabilities = torch.sigmoid(output)
+                logits = model(images, expert_features)
+                expert_outputs.append(logits)
+            
+            # Construct Meta Input
+            expert_logits_cat = torch.cat(expert_outputs, dim=1)
+            
+            meta_col_indices = [feature_map[c] for c in meta_features_list]
+            meta_features_batch = batch_features_all[:, meta_col_indices]
+            
+            meta_input = torch.cat([expert_logits_cat, meta_features_batch], dim=1)
+            
+            final_logits = meta_learner(meta_input)
+            probs = torch.sigmoid(final_logits)
+            
+            all_preds.append(probs.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+            all_frame_ids.extend(frame_ids.numpy())
+            if global_embedding is not None:
+                all_embeddings.append(global_embedding)
 
-                current_model_labels.append(labels.cpu().numpy())
-                current_model_preds.append(probabilities.cpu().numpy())
-                current_model_frame_ids.extend(frame_ids.numpy())
-                current_model_embeddings.append(embedding.cpu().numpy())
-
-        all_model_preds.append(np.concatenate(current_model_preds))
-        all_model_embeddings.append(np.concatenate(current_model_embeddings))
-        
-        if final_labels is None:
-            final_labels = np.concatenate(current_model_labels)
-            final_frame_ids = np.array(current_model_frame_ids)
-
-    avg_preds = np.mean(all_model_preds, axis=0)
-    avg_embeddings = np.mean(all_model_embeddings, axis=0)
-
-    return final_labels, avg_preds, final_frame_ids, avg_embeddings
+    return (
+        np.concatenate(all_labels),
+        np.concatenate(all_preds),
+        np.array(all_frame_ids),
+        np.concatenate(all_embeddings)
+    )
 
 def plot_class_distribution(df, action_columns, output_dir):
     plt.figure(figsize=(10, 6))
@@ -172,11 +245,17 @@ def plot_confusion_matrix(true_labels, pred_probs, action_columns, output_dir):
         plt.close()
         
 def plot_pair_plots(pred_probs, action_columns, output_dir):
+    """
+    Plots pair plots. Uses hexbin-style 2D histograms for off-diagonal elements
+    to handle large data density better than scatter plots.
+    """
     df = pd.DataFrame(pred_probs, columns=action_columns)
-    plt.figure(figsize=(15, 15))
-    sns.pairplot(df.sample(n=min(1000, len(df))), kind='reg', diag_kind='kde')
-    plt.suptitle('Pair Plot of Predicted Probabilities', y=1.02)
-    plt.savefig(os.path.join(output_dir, '6_pair_plot_of_probabilities.png'))
+    
+    # Use 'hist' kind which creates 2D histograms (binned plots), similar to hexbin but square bins
+    # This answers the user's request for hexbin-like plotting for pairs
+    g = sns.pairplot(df.sample(n=min(5000, len(df))), kind='hist', diag_kind='kde', corner=True)
+    g.fig.suptitle('Pair Plot of Predicted Probabilities (Density)', y=1.02)
+    plt.savefig(os.path.join(output_dir, '6_pair_plot_hexbin_style.png'))
     plt.close()
 
 def plot_roc_pr_curves(true_labels, pred_probs, action_columns, output_dir):
@@ -229,23 +308,47 @@ def visualize_similar_images(true_labels, embeddings, frame_ids, frame_id_to_pat
         print(f"Finding similar images with >{threshold*100}% similarity...")
         pairs_found = 0
         
-        sim_matrix = cosine_similarity(embeddings)
+        # Calculate similarity on a subset if dataset is huge to avoid OOM
+        subset_size = min(5000, len(embeddings))
+        indices_subset = np.random.choice(len(embeddings), subset_size, replace=False)
+        embeddings_subset = embeddings[indices_subset]
+        labels_subset = true_labels[indices_subset]
+        frame_ids_subset = frame_ids[indices_subset]
+
+        sim_matrix = cosine_similarity(embeddings_subset)
         np.fill_diagonal(sim_matrix, 0)
+        
+        # Find upper triangle indices
         indices = np.triu_indices_from(sim_matrix, k=1)
-        sorted_indices = np.argsort(-sim_matrix[indices])
-
-        for idx in sorted_indices:
-            if pairs_found >= n_pairs: break
-            i, j = indices[0][idx], indices[1][idx]
+        
+        # Filter by threshold first to reduce sorting cost
+        mask = sim_matrix[indices] > threshold
+        if not np.any(mask):
+            continue
             
-            if sim_matrix[i, j] > threshold:
-                label_i, label_j = true_labels[i], true_labels[j]
+        filtered_sims = sim_matrix[indices][mask]
+        filtered_indices = (indices[0][mask], indices[1][mask])
+        
+        # Sort by similarity desc
+        sorted_order = np.argsort(-filtered_sims)
+        
+        for idx in sorted_order:
+            if pairs_found >= n_pairs: break
+            i, j = filtered_indices[0][idx], filtered_indices[1][idx]
+            
+            label_i, label_j = labels_subset[i], labels_subset[j]
 
-                if not np.array_equal(label_i, label_j):
-                    pairs_found += 1
-                    
-                    frame_id_i, frame_id_j = frame_ids[i], frame_ids[j]
-                    img_i, img_j = cv2.imread(frame_id_to_path[frame_id_i]), cv2.imread(frame_id_to_path[frame_id_j])
+            # Check if labels are different
+            if not np.array_equal(label_i, label_j):
+                pairs_found += 1
+                
+                frame_id_i, frame_id_j = frame_ids_subset[i], frame_ids_subset[j]
+                
+                path_i = frame_id_to_path.get(frame_id_i)
+                path_j = frame_id_to_path.get(frame_id_j)
+                
+                if path_i and path_j and os.path.exists(path_i) and os.path.exists(path_j):
+                    img_i, img_j = cv2.imread(path_i), cv2.imread(path_j)
                     
                     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
                     
@@ -267,31 +370,20 @@ def main():
     print("Starting evaluation script...")
     
     DATA_DIR = r"C:\Users\muusm\Documents\ML_project\Hollow-Knight-AI\HKData"
-    MODEL_DIR = 'model'
+    MODEL_DIR = 'model' # New model directory
     OUTPUT_DIR = 'evaluation_results'
     EVAL_ON_ALL_DATA = True
-
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print("Loading ensemble for evaluation...")
-    ensemble_dirs = sorted([os.path.join(MODEL_DIR, d) for d in os.listdir(MODEL_DIR) if d.startswith('ensemble_')])
-    if not ensemble_dirs:
-        print(f"No ensemble models found in {MODEL_DIR}. Exiting.")
-        return
-
-    models_with_info = []
-    for model_dir in ensemble_dirs:
-        model, info = load_model_for_inference(model_dir)
-        models_with_info.append((model, info))
-
-    if not models_with_info:
-        print("No models were successfully loaded. Exiting.")
-        return
-        
-    action_columns = models_with_info[0][1]['action_columns']
-    print(f"Loaded {len(models_with_info)} models.")
+    action_columns = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
 
     csv_files = [f for f in os.listdir(DATA_DIR) if f.startswith('hk_actions_') and f.endswith('.csv')]
+    if not csv_files:
+        print("No CSV files found.")
+        return
+
     data_to_load = csv_files if EVAL_ON_ALL_DATA else [max(csv_files)]
     
     master_df = pd.concat([
@@ -306,7 +398,12 @@ def main():
     if master_df.empty:
         print("No data could be loaded for evaluation."); return
         
-    true_labels, pred_probs, frame_ids, embeddings = get_predictions(models_with_info, master_df)
+    try:
+        true_labels, pred_probs, frame_ids, embeddings = get_predictions(MODEL_DIR, master_df, device=device)
+    except FileNotFoundError as e:
+        print(f"Error loading models: {e}")
+        return
+
     print(f"Got predictions for {len(true_labels)} samples.")
     
     temp_dataset = HollowKnightDataset(data_df=master_df.copy(), image_size=None)
@@ -322,7 +419,7 @@ def main():
     plot_confusion_matrix(true_labels, pred_probs, action_columns, OUTPUT_DIR)
     print("5. Confusion matrices generated.")
     plot_pair_plots(pred_probs, action_columns, OUTPUT_DIR)
-    print("6. Pair plots of probabilities generated.")
+    print("6. Pair plots (Hexbin/Hist style) generated.")
     plot_roc_pr_curves(true_labels, pred_probs, action_columns, OUTPUT_DIR)
     print("7, 8. ROC and Precision-Recall curves generated.")
     plot_qq(pred_probs, action_columns, OUTPUT_DIR)

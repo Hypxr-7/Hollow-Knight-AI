@@ -9,50 +9,66 @@ import pyautogui
 import time
 from collections import deque
 
-from train import BehavioralCloningNet, load_model_for_inference
+from train import BehavioralCloningNet, MetaLearner, load_model_for_inference
 
-class EnsembleAgent:
+class MetaLearnerAgent:
     """
-    An agent that uses an ensemble of CNN models to make predictions.
-    Supports frame stacking and stateful feature engineering.
+    An agent that uses a Meta-Learner ensemble of specialized CNN experts.
     """
     def __init__(self, model_base_dir='model'):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Agent initialized on device: {self.device}", file=sys.stderr)
-        self.models_with_info = []
-
-        print("Loading ensemble models...", file=sys.stderr)
         
-        # Find all ensemble directories
-        ensemble_dirs = sorted([
-            os.path.join(model_base_dir, d) for d in os.listdir(model_base_dir) 
-            if d.startswith('ensemble_') and os.path.isdir(os.path.join(model_base_dir, d))
-        ])
+        self.experts = {}
+        expert_names = ['global', 'movement', 'jump_dash', 'combat']
         
-        if not ensemble_dirs:
-            raise FileNotFoundError(f"No 'ensemble_*' directories found in '{model_base_dir}'")
-
-        print(f"Found {len(ensemble_dirs)} models in the ensemble.", file=sys.stderr)
-
-        # Load models and determine requirements
+        # Load Experts
+        print("Loading expert models...", file=sys.stderr)
         self.max_frames_needed = 1
+        total_expert_output_dim = 0
         
-        for model_dir in ensemble_dirs:
-            print(f"Loading model from {model_dir}...", file=sys.stderr)
+        for name in expert_names:
+            model_dir = os.path.join(model_base_dir, f"ensemble_{name}")
+            if not os.path.exists(model_dir):
+                raise FileNotFoundError(f"Expert model not found at {model_dir}")
+                
             model, info = load_model_for_inference(model_dir)
             model.to(self.device)
-            self.models_with_info.append((model, info))
+            model.eval()
+            self.experts[name] = {'model': model, 'info': info}
             
+            # Sum up output dimensions for meta-learner input size calculation
+            # 'action_columns' in info tells us how many outputs this expert has
+            total_expert_output_dim += len(info.get('action_columns', []))
+
             n_frames = info.get('n_frames', 1)
             if 'image_shape' in info and len(info['image_shape']) == 3:
                 n_frames = max(n_frames, info['image_shape'][0])
-            
             self.max_frames_needed = max(self.max_frames_needed, n_frames)
+
+        # Load Meta-Learner Info
+        meta_info_path = os.path.join(model_base_dir, 'meta_info.json')
+        if not os.path.exists(meta_info_path):
+             raise FileNotFoundError(f"Meta info not found at {meta_info_path}")
         
-        # Buffer to store the last N raw frames
+        with open(meta_info_path, 'r') as f:
+            self.meta_info = json.load(f)
+            
+        self.meta_features_list = self.meta_info.get('meta_features', [])
+        meta_input_dim = total_expert_output_dim + len(self.meta_features_list)
+        
+        print(f"Meta-Learner Input Dim: {meta_input_dim}", file=sys.stderr)
+
+        # Load Meta-Learner Model
+        meta_path = os.path.join(model_base_dir, 'meta_learner.pth')
+        self.meta_learner = MetaLearner(input_dim=meta_input_dim, output_dim=5)
+        self.meta_learner.load_state_dict(torch.load(meta_path, map_location=self.device))
+        self.meta_learner.to(self.device)
+        self.meta_learner.eval()
+
         self.frame_history = deque(maxlen=self.max_frames_needed)
         
-        # State tracking for feature engineering
+        # State for feature engineering
         self.last_player_x = None
         self.last_player_y = None
         self.last_enemy_x = None
@@ -62,124 +78,123 @@ class EnsembleAgent:
             'attacking': 0.0, 'jumping': 0.0, 'dashing': 0.0
         }
         
-        self.action_columns = self.models_with_info[0][1]['action_columns']
-
+        self.action_columns = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
         self.action_keys = {
             'moving_left': 'left', 'moving_right': 'right',
             'attacking': 'x', 'jumping': 'z', 'dashing': 'c'
         }
         self.pressed_keys = set()
         
-        # Optimize PyAutoGUI speed
         pyautogui.PAUSE = 0
-        
-        print(f"Ensemble loaded with {len(self.models_with_info)} models. Max history: {self.max_frames_needed} frames.")
+        print("MetaLearner Agent Ready!", file=sys.stderr)
 
     def _engineer_features_inference(self, player_x, player_y, enemy_x, enemy_y):
-        """
-        Replicates the logic from train.py's engineer_features function in a stateful way.
-        """
-        # Initialize previous state on first frame
         if self.last_player_x is None:
             self.last_player_x = player_x
             self.last_player_y = player_y
             self.last_enemy_x = enemy_x
             self.last_enemy_y = enemy_y
 
-        # 1. Deltas
         player_dx = player_x - self.last_player_x
         player_dy = player_y - self.last_player_y
         enemy_dx = enemy_x - self.last_enemy_x
         enemy_dy = enemy_y - self.last_enemy_y
         
-        # 2. Speed
         player_speed = np.sqrt(player_dx**2 + player_dy**2)
-        
-        # 3. Distance
         enemy_distance = np.sqrt((player_x - enemy_x)**2 + (player_y - enemy_y)**2)
         
-        # Update state for next frame
         self.last_player_x = player_x
         self.last_player_y = player_y
         self.last_enemy_x = enemy_x
         self.last_enemy_y = enemy_y
         
-        # 4. Previous Actions 
-        # Order must match train.py:
-        # ['x_position', 'y_position', 'enemy_x', 'enemy_y', 
-        #  'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
-        #  'player_speed', 'enemy_distance',
-        #  'prev_moving_left', 'prev_moving_right', 'prev_attacking', 'prev_jumping', 'prev_dashing']
-        
-        features = [
-            player_x, player_y, enemy_x, enemy_y,
-            player_dx, player_dy, enemy_dx, enemy_dy,
-            player_speed, enemy_distance,
-            self.prev_actions['moving_left'], self.prev_actions['moving_right'],
-            self.prev_actions['attacking'], self.prev_actions['jumping'], self.prev_actions['dashing']
-        ]
-        
-        return torch.FloatTensor(features).unsqueeze(0).to(self.device)
+        # Return a dictionary of ALL available features
+        features = {
+            'x_position': player_x,
+            'y_position': player_y,
+            'enemy_x': enemy_x,
+            'enemy_y': enemy_y,
+            'player_dx': player_dx,
+            'player_dy': player_dy,
+            'enemy_dx': enemy_dx,
+            'enemy_dy': enemy_dy,
+            'player_speed': player_speed,
+            'enemy_distance': enemy_distance,
+            'prev_moving_left': self.prev_actions['moving_left'],
+            'prev_moving_right': self.prev_actions['moving_right'],
+            'prev_attacking': self.prev_actions['attacking'],
+            'prev_jumping': self.prev_actions['jumping'],
+            'prev_dashing': self.prev_actions['dashing']
+        }
+        return features
 
     def predict_from_bytes(self, image_bytes, width, height, player_x, player_y, enemy_x, enemy_y):
         try:
-            # --- Preprocessing for CNN ---
-            # Decode raw bytes to numpy array (H, W, 3) - RGB
             image_np = np.frombuffer(image_bytes, dtype=np.uint8).reshape((height, width, 3))
-            
-            # Convert to Grayscale
             gray_frame = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-            frame_to_use = gray_frame
-            
-            # Update Frame History
-            self.frame_history.append(frame_to_use)
+            self.frame_history.append(gray_frame)
 
-            # --- Feature Engineering ---
-            # Check what features the first model expects
-            required_features = self.models_with_info[0][1].get('feature_columns', ['x_position', 'y_position', 'enemy_x', 'enemy_y'])
-            
-            if len(required_features) > 4:
-                # Use full engineered features with RAW coordinates
-                other_features = self._engineer_features_inference(player_x, player_y, enemy_x, enemy_y)
-            else:
-                # Fallback for legacy models
-                other_features = torch.FloatTensor([player_x, player_y, enemy_x, enemy_y]).unsqueeze(0).to(self.device)
+            # Get dictionary of all features
+            feature_dict = self._engineer_features_inference(player_x, player_y, enemy_x, enemy_y)
 
-            # --- Ensemble Prediction ---
-            all_logits = []
-            with torch.no_grad():
-                for model, info in self.models_with_info:
-                    target_n_frames = info.get('n_frames', 1)
-                    if 'image_shape' in info and len(info['image_shape']) == 3:
-                        target_n_frames = max(target_n_frames, info['image_shape'][0])
-                    
-                    target_h = info['image_shape'][1]
-                    target_w = info['image_shape'][2]
-                    
-                    history_list = list(self.frame_history)
-                    while len(history_list) < target_n_frames:
-                        history_list.insert(0, history_list[0])
-                    relevant_frames = history_list[-target_n_frames:][::-1]
-                    
-                    processed_frames = []
-                    for frm in relevant_frames:
-                        if frm.shape[0] != target_h or frm.shape[1] != target_w:
-                            resized = cv2.resize(frm, (target_w, target_h), interpolation=cv2.INTER_AREA)
-                            processed_frames.append(resized)
-                        else:
-                            processed_frames.append(frm)
-                    
-                    stack_np = np.stack(processed_frames, axis=0)
-                    image_tensor = torch.from_numpy(stack_np).float().to(self.device) / 255.0
-                    image_tensor = image_tensor.unsqueeze(0)
-                    
-                    logits = model(image_tensor, other_features)
-                    all_logits.append(logits)
+            # Get predictions from all experts
+            expert_outputs = []
             
-            avg_logits = torch.stack(all_logits).mean(dim=0)
-            predictions = torch.sigmoid(avg_logits).cpu().numpy()[0]
+            # IMPORTANT: Iterate in the same order as trained!
+            # Global, Movement, JumpDash, Combat
+            for name in ['global', 'movement', 'jump_dash', 'combat']:
+                expert = self.experts[name]
+                model = expert['model']
+                info = expert['info']
+                
+                # Dynamic Feature Selection for this Expert
+                required_cols = info.get('feature_columns', [])
+                expert_feats = [feature_dict.get(col, 0.0) for col in required_cols]
+                other_features = torch.FloatTensor(expert_feats).unsqueeze(0).to(self.device)
+                
+                # Image Stacking Logic
+                target_n_frames = info.get('n_frames', 1)
+                if 'image_shape' in info and len(info['image_shape']) == 3:
+                    target_n_frames = max(target_n_frames, info['image_shape'][0])
+                
+                target_h = info['image_shape'][1]
+                target_w = info['image_shape'][2]
+                
+                history_list = list(self.frame_history)
+                while len(history_list) < target_n_frames:
+                    history_list.insert(0, history_list[0])
+                relevant_frames = history_list[-target_n_frames:][::-1]
+                
+                processed_frames = []
+                for frm in relevant_frames:
+                    if frm.shape[0] != target_h or frm.shape[1] != target_w:
+                        resized = cv2.resize(frm, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                        processed_frames.append(resized)
+                    else:
+                        processed_frames.append(frm)
+                
+                stack_np = np.stack(processed_frames, axis=0)
+                image_tensor = torch.from_numpy(stack_np).float().to(self.device) / 255.0
+                image_tensor = image_tensor.unsqueeze(0)
+                
+                logits = model(image_tensor, other_features)
+                expert_outputs.append(logits)
+            
+            # Build Meta-Learner Input
+            # Concatenate all expert logits
+            expert_logits_cat = torch.cat(expert_outputs, dim=1)
+            
+            # Get Meta Features
+            meta_feats_vals = [feature_dict.get(col, 0.0) for col in self.meta_features_list]
+            meta_feats_tensor = torch.FloatTensor(meta_feats_vals).unsqueeze(0).to(self.device)
+            
+            # Final Input: [Expert Logits, Meta Context]
+            meta_input = torch.cat([expert_logits_cat, meta_feats_tensor], dim=1)
+            
+            final_logits = self.meta_learner(meta_input)
+            predictions = torch.sigmoid(final_logits).cpu().detach().numpy()[0]
 
-            # --- Update State for Next Frame ---
+            # Update State
             thresholds = {
                 'moving_left': 0.17, 'moving_right': 0.17,
                 'attacking': 0.17, 'jumping': 0.17, 'dashing': 0.17
@@ -188,7 +203,6 @@ class EnsembleAgent:
             for i, col in enumerate(self.action_columns):
                  self.prev_actions[col] = 1.0 if predictions[i] > thresholds.get(col, 0.5) else 0.0
 
-            # --- Action Logic ---
             active_actions = self.execute_actions(predictions, thresholds)
             return active_actions, predictions
             
@@ -200,9 +214,7 @@ class EnsembleAgent:
             return [], []
 
     def execute_actions(self, predictions, thresholds):
-        """Determine which keys to press or release based on predictions."""
         press_action_names = {'attacking', 'dashing'}
-
         desired_holds = set()
         active_actions = []
 
@@ -215,7 +227,6 @@ class EnsembleAgent:
                 else:
                     desired_holds.add(action_key)
 
-        # Handle mutual exclusion for movement
         if 'left' in desired_holds and 'right' in desired_holds:
             if predictions[self.action_columns.index('moving_left')] > predictions[self.action_columns.index('moving_right')]:
                 desired_holds.discard('right')
@@ -224,7 +235,6 @@ class EnsembleAgent:
                 desired_holds.discard('left')
                 if 'moving_left' in active_actions: active_actions.remove('moving_left')
         
-        # Update held keys
         keys_to_release = self.pressed_keys - desired_holds
         for key in keys_to_release:
             pyautogui.keyUp(key)
@@ -234,7 +244,6 @@ class EnsembleAgent:
             pyautogui.keyDown(key)
             
         self.pressed_keys = desired_holds
-        
         return active_actions
 
     def release_all_keys(self):
@@ -243,16 +252,15 @@ class EnsembleAgent:
         self.pressed_keys.clear()
 
 def main():
-    """Main inference loop for the ensemble agent."""
     sys.stdout.reconfigure(encoding='utf-8')
     
     if len(sys.argv) > 1:
         model_base_dir = sys.argv[1]
     else:
-        model_base_dir = 'model'
+        model_base_dir = 'model_2' # Default to new structure
         
     try:
-        agent = EnsembleAgent(model_base_dir)
+        agent = MetaLearnerAgent(model_base_dir)
         print("READY")
         sys.stdout.flush()
         
@@ -280,14 +288,6 @@ def main():
                         pX, pY = float(parts[3]), float(parts[4])
                         eX, eY = float(parts[5]), float(parts[6])
                         
-                        # --- REMOVED NORMALIZATION ---
-                        # Used to be: norm_pX = pX / 1920.0
-                        # Now passing RAW values:
-                        raw_pX = pX
-                        raw_pY = pY
-                        raw_eX = eX
-                        raw_eY = eY
-
                         expected_size = width * height * 3
                         
                         image_bytes = bytearray()
@@ -301,8 +301,8 @@ def main():
                         
                         active_actions, predictions_array = agent.predict_from_bytes(
                             bytes(image_bytes), width, height,
-                            player_x=raw_pX, player_y=raw_pY,
-                            enemy_x=raw_eX, enemy_y=raw_eY
+                            player_x=pX, player_y=pY,
+                            enemy_x=eX, enemy_y=eY
                         )
                         dt = (time.time() - t0) * 1000
                         
