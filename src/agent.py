@@ -312,7 +312,7 @@ def main():
                         
                         action_names = agent.action_columns
                         full_action_str = ", ".join([f"{name}={prob:.2f}" for name, prob in zip(action_names, predictions_array)])
-                        features_str = f"Px={pX:.1f} Ex={eX:.1f} Img={img_mean:.1f}/{img_std:.1f}"
+                        features_str = f"P({pX:.1f},{pY:.1f}) E({eX:.1f},{eY:.1f}) Img={img_mean:.1f}/{img_std:.1f}"
                         
                         print(f"KEYS:{','.join(active_actions)} | {dt:.1f}ms | Feat: {features_str} | Probs: {full_action_str}")
                         sys.stdout.flush()
