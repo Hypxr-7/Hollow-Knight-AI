@@ -680,7 +680,7 @@ def main():
         
         model = BehavioralCloningNet(
             image_shape=(STACK_SIZE, hp['image_size'][1], hp['image_size'][0]), 
-            other_features_dim=len(feature_columns),
+            other_features_dim=len(input_feature_columns),
             dropout_rate=hp['dropout_rate']
         )
         
