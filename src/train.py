@@ -16,6 +16,7 @@ from tqdm import tqdm
 # Scikit-learn imports
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_curve
+from sklearn.preprocessing import StandardScaler
 
 # PyTorch imports
 import torch
@@ -23,6 +24,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import torchvision.transforms as transforms
+import torchvision.models as models
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import torch.cuda.amp as amp
@@ -30,15 +32,27 @@ import torch.cuda.amp as amp
 # Warnings configuration
 warnings.filterwarnings('ignore')
 
+def get_transforms(img_size, is_train=False):
+    """
+    Returns the transformation pipeline.
+    """
+    if is_train:
+        return transforms.Compose([
+            transforms.Resize(img_size, interpolation=transforms.InterpolationMode.LANCZOS),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            # Geometric jitter (scaling) without rotation/translation
+            transforms.RandomAffine(degrees=0, translate=None, scale=(0.95, 1.05)),
+        ])
+    else:
+        return transforms.Compose([
+            transforms.Resize(img_size, interpolation=transforms.InterpolationMode.LANCZOS),
+        ])
+
 def engineer_features(df):
     """
     Adds derived features to the dataframe.
     Assumes df contains a single contiguous session or is carefully handled.
     """
-    # Handle missing enemy data (if 0,0 represents missing)
-    # If enemy coordinates are exactly 0.0, 0.0, we might want to treat distance as "large" or "0"?
-    # For now, we compute as is, but you can mask it if needed.
-    
     # 1. Deltas (Velocity)
     df['player_dx'] = df['x_position'].diff().fillna(0)
     df['player_dy'] = df['y_position'].diff().fillna(0)
@@ -51,10 +65,26 @@ def engineer_features(df):
     # 3. Euclidean Distance to Enemy
     df['enemy_distance'] = np.sqrt((df['x_position'] - df['enemy_x'])**2 + (df['y_position'] - df['enemy_y'])**2)
     
-    # 4. Previous Actions
+    # 4. Relative Position (Enemy relative to Player)
+    df['rel_x'] = df['enemy_x'] - df['x_position']
+    df['rel_y'] = df['enemy_y'] - df['y_position']
+
+    # 5. Relative Velocity (Difference in velocities)
+    df['vel_diff_x'] = df['player_dx'] - df['enemy_dx']
+    df['vel_diff_y'] = df['player_dy'] - df['enemy_dy']
+    
+    # 6. Temporal Stacking (Locality for 3 frames)
+    # We create history for scalar features so that shuffling rows doesn't break the context
+    cols_to_shift = [
+        'x_position', 'y_position', 'enemy_x', 'enemy_y',
+        'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
+        'rel_x', 'rel_y', 'enemy_distance'
+    ]
     action_cols = ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']
-    for col in action_cols:
-        df[f'prev_{col}'] = df[col].shift(1).fillna(0)
+    
+    for col in cols_to_shift + action_cols:
+        df[f'{col}_t1'] = df[col].shift(1).fillna(0)
+        df[f'{col}_t2'] = df[col].shift(2).fillna(0)
         
     return df
 
@@ -118,21 +148,28 @@ class HollowKnightDataset(Dataset):
             
             if os.path.exists(path):
                 with Image.open(path).convert('L') as img:
-                    if self.image_size:
+                    # Apply resize if not using transforms, or if we need a specific size
+                    if self.image_size and not self.transform:
                         img = img.resize(self.image_size, Image.Resampling.LANCZOS)
-                    img_tensor = transforms.ToTensor()(img)
+                    
+                    if self.transform:
+                        # transforms expect PIL or Tensor
+                        img_tensor = self.transform(img)
+                        if not isinstance(img_tensor, torch.Tensor):
+                             img_tensor = transforms.ToTensor()(img_tensor)
+                    else:
+                        img_tensor = transforms.ToTensor()(img)
+                    
                     frames.append(img_tensor)
             else:
                 if frames:
                     frames.append(frames[-1])
                 else:
-                    frames.append(torch.zeros(1, self.image_size[1], self.image_size[0]))
+                    h, w = self.image_size[1], self.image_size[0]
+                    frames.append(torch.zeros(1, h, w))
 
         image_stack = torch.cat(frames, dim=0)
         
-        if self.transform:
-            image_stack = self.transform(image_stack)
-
         # Dynamic feature extraction
         other_features = torch.FloatTensor([float(row[col]) for col in self.feature_columns])
         
@@ -141,43 +178,50 @@ class HollowKnightDataset(Dataset):
         return image_stack, other_features, actions
 
 
-class BehavioralCloningNet(nn.Module):
+class ResNetBehavioralCloningNet(nn.Module):
     """
-    CNN for multi-label behavioral cloning.
-    Processes image data with convolutional layers and combines it with positional data.
+    ResNet-based CNN for multi-label behavioral cloning.
+    Uses a ResNet18 backbone for better feature extraction.
     """
-    def __init__(self, image_shape=(1, 60, 80), other_features_dim=4, num_actions=5, dropout_rate=0.5):
-        super(BehavioralCloningNet, self).__init__()
+    def __init__(self, image_shape=(3, 160, 320), other_features_dim=4, num_actions=5, dropout_rate=0.5):
+        super(ResNetBehavioralCloningNet, self).__init__()
         
-        self.conv1 = nn.Conv2d(in_channels=image_shape[0], out_channels=32, kernel_size=5, padding=2)
-        self.bn1 = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-
-        self._conv_out_shape = self._get_conv_out_shape(image_shape)
+        # Load Pretrained ResNet18
+        self.resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
         
-        self.fc1 = nn.Linear(self._conv_out_shape + other_features_dim, 256)
-        self.bn3 = nn.BatchNorm1d(256)
+        # Modify first layer to accept 'image_shape[0]' channels (frame stack depth)
+        original_first_conv = self.resnet.conv1
+        if image_shape[0] != 3:
+            self.resnet.conv1 = nn.Conv2d(
+                in_channels=image_shape[0], 
+                out_channels=original_first_conv.out_channels,
+                kernel_size=original_first_conv.kernel_size,
+                stride=original_first_conv.stride,
+                padding=original_first_conv.padding,
+                bias=original_first_conv.bias is not None
+            )
+            nn.init.kaiming_normal_(self.resnet.conv1.weight, mode='fan_out', nonlinearity='relu')
+        
+        # Remove the fully connected layer
+        self.num_ftrs = self.resnet.fc.in_features
+        self.resnet.fc = nn.Identity()
+        
+        # Fusion Layer
+        self.fusion_fc = nn.Linear(self.num_ftrs + other_features_dim, 256)
+        self.bn1 = nn.BatchNorm1d(256)
         self.dropout = nn.Dropout(dropout_rate)
-        self.fc2 = nn.Linear(256, num_actions)
-
-    def _get_conv_out_shape(self, shape):
-        with torch.no_grad():
-            dummy_tensor = torch.zeros(1, *shape)
-            x = self.pool(F.relu(self.bn1(self.conv1(dummy_tensor))))
-            x = self.pool(F.relu(self.bn2(self.conv2(x))))
-            return int(np.prod(x.shape))
+        self.final_fc = nn.Linear(256, num_actions)
 
     def forward(self, image, other_features):
-        x = self.pool(F.relu(self.bn1(self.conv1(image))))
-        x = self.pool(F.relu(self.bn2(self.conv2(x))))
-        x = x.view(x.size(0), -1)
+        x = self.resnet(image)
         combined = torch.cat([x, other_features], dim=1)
-        combined = F.relu(self.bn3(self.fc1(combined)))
-        combined = self.dropout(combined)
-        output = self.fc2(combined)
+        x = F.relu(self.bn1(self.fusion_fc(combined)))
+        x = self.dropout(x)
+        output = self.final_fc(x)
         return output
+
+# Alias for backward compatibility
+BehavioralCloningNet = ResNetBehavioralCloningNet
 
 
 class FocalLoss(nn.Module):
@@ -420,7 +464,7 @@ class BehavioralCloningTrainer:
         
         return best_val_loss, self.per_action_accuracies[-1] if self.per_action_accuracies else [0]*5, optimal_thresholds
 
-def export_model_for_inference(model, image_size, n_frames, feature_columns, thresholds, output_dir='model'):
+def export_model_for_inference(model, image_size, n_frames, feature_columns, thresholds, scaler=None, output_dir='model'):
     os.makedirs(output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(output_dir, 'model.pth'))
     
@@ -434,6 +478,11 @@ def export_model_for_inference(model, image_size, n_frames, feature_columns, thr
         'n_frames': n_frames,
         'thresholds': thresholds
     }
+    
+    if scaler:
+        model_info['scaler_mean'] = scaler.mean_.tolist()
+        model_info['scaler_scale'] = scaler.scale_.tolist()
+
     with open(os.path.join(output_dir, 'model_info.json'), 'w') as f:
         json.dump(model_info, f, indent=2)
     
@@ -452,7 +501,17 @@ def load_model_for_inference(model_dir='model'):
     feature_columns = model_info.get('feature_columns', ['x_position', 'y_position', 'enemy_x', 'enemy_y'])
     other_features_dim = model_info.get('other_features_dim', 4)
 
-    model = BehavioralCloningNet(
+    # Reconstruct the Scaler if info is present
+    scaler = None
+    if 'scaler_mean' in model_info and 'scaler_scale' in model_info:
+        scaler = StandardScaler()
+        scaler.mean_ = np.array(model_info['scaler_mean'])
+        scaler.scale_ = np.array(model_info['scaler_scale'])
+        # Scikit-learn requires these to be set for the scaler to be considered "fitted"
+        scaler.var_ = scaler.scale_ ** 2
+        scaler.n_samples_seen_ = 1000 # Dummy value
+
+    model = ResNetBehavioralCloningNet(
         image_shape=tuple(model_info['image_shape']),
         other_features_dim=other_features_dim,
         num_actions=model_info['num_actions']
@@ -464,7 +523,7 @@ def load_model_for_inference(model_dir='model'):
     
     model_info['feature_columns'] = feature_columns
     
-    return model, model_info
+    return model, model_info, scaler
 
 def main():
     """Main script to train an ensemble of quality-controlled CNN models."""
@@ -512,26 +571,46 @@ def main():
     master_df = pd.concat(all_dfs, ignore_index=True)
     if len(master_df) == 0: print("No valid data in master DataFrame. Exiting."); return
 
-    feature_columns = [
+    # Define the full set of 19 + (16*2) features = 51 features
+    base_features = [
         'x_position', 'y_position', 'enemy_x', 'enemy_y', 
         'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy', 
-        'player_speed', 'enemy_distance',                 
-        'prev_moving_left', 'prev_moving_right', 'prev_attacking', 'prev_jumping', 'prev_dashing' 
+        'player_speed', 'enemy_distance', 
+        'rel_x', 'rel_y', 'vel_diff_x', 'vel_diff_y',
+        'moving_left', 'moving_right', 'attacking', 'jumping', 'dashing'
     ]
     
-    print(f"Using {len(feature_columns)} extra features: {feature_columns}")
+    feature_columns = base_features.copy()
+    for col in [
+        'x_position', 'y_position', 'enemy_x', 'enemy_y',
+        'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
+        'rel_x', 'rel_y', 'enemy_distance',
+        'moving_left', 'moving_right', 'attacking', 'jumping', 'dashing'
+    ]:
+        feature_columns.append(f'{col}_t1')
+        feature_columns.append(f'{col}_t2')
+    
+    # Filter out columns that aren't inputs (labels are target, but here we use history as input)
+    input_feature_columns = [c for c in feature_columns if c not in ['moving_left', 'moving_right', 'attacking', 'jumping', 'dashing']]
+    
+    print(f"Using {len(input_feature_columns)} input features.")
+
+    # --- Feature Normalization ---
+    print("Fitting StandardScaler on scalar features...")
+    scaler = StandardScaler()
+    master_df[input_feature_columns] = scaler.fit_transform(master_df[input_feature_columns])
 
     print(f"\n--- Searching for {NUM_MODELS_TO_FIND} 'Good' Models (Min Action Accuracy > {MIN_ACTION_ACCURACY}) ---")
     print(f"Frame Stacking: {STACK_SIZE}")
     print(f"TensorBoard Logs: {BASE_LOG_DIR}")
     
     search_space = {
-        'learning_rate': [5e-5, 1e-4, 5e-4],
-        'dropout_rate': [0.3, 0.4, 0.5],
-        'weight_decay': [1e-5, 1e-4, 5e-4],
-        'loss_type': ['bce', 'focal'],
-        'image_size': [(640,320),(320,160)],
-        'batch_size': [32,64, 94]
+        'learning_rate': [1e-4, 2e-4],
+        'dropout_rate': [0.4, 0.5],
+        'weight_decay': [1e-4, 5e-4],
+        'loss_type': ['focal'],
+        'image_size': [(224, 224)], # ResNet standard size works well
+        'batch_size': [32, 48]
     }
     
     saved_models_count = 0
@@ -571,16 +650,16 @@ def main():
         train_trial_dataset = HollowKnightDataset(
             data_df=train_df,
             image_size=hp['image_size'],
-            transform=None,
+            transform=get_transforms(hp['image_size'], is_train=True),
             n_frames=STACK_SIZE,
-            feature_columns=feature_columns
+            feature_columns=input_feature_columns
         )
         val_trial_dataset = HollowKnightDataset(
             data_df=val_df,
             image_size=hp['image_size'],
-            transform=None, 
+            transform=get_transforms(hp['image_size'], is_train=False), 
             n_frames=STACK_SIZE,
-            feature_columns=feature_columns
+            feature_columns=input_feature_columns
         )
         
         if len(train_trial_dataset) == 0:
@@ -619,7 +698,10 @@ def main():
             saved_models_count += 1
             print(f"\nSUCCESS! Model passed quality check. Saving as ensemble member #{saved_models_count}.")
             output_dir = f"model/ensemble_{saved_models_count}"
-            export_model_for_inference(model, hp['image_size'], STACK_SIZE, feature_columns, optimal_thresholds, output_dir=output_dir)
+            export_model_for_inference(
+                model, hp['image_size'], STACK_SIZE, input_feature_columns, 
+                optimal_thresholds, scaler=scaler, output_dir=output_dir
+            )
             trainer.plot_training_history(save_path=os.path.join(output_dir, 'training_history.png'))
             with open(os.path.join(output_dir, 'hyperparameters.json'), 'w') as f:
                 json.dump(hp, f, indent=2)

@@ -39,9 +39,9 @@ class EnsembleAgent:
         
         for model_dir in ensemble_dirs:
             print(f"Loading model from {model_dir}...", file=sys.stderr)
-            model, info = load_model_for_inference(model_dir)
+            model, info, scaler = load_model_for_inference(model_dir)
             model.to(self.device)
-            self.models_with_info.append((model, info))
+            self.models_with_info.append((model, info, scaler))
             
             n_frames = info.get('n_frames', 1)
             if 'image_shape' in info and len(info['image_shape']) == 3:
@@ -62,6 +62,9 @@ class EnsembleAgent:
             'attacking': 0.0, 'jumping': 0.0, 'dashing': 0.0
         }
         
+        # Maintain history of raw metrics for 3-frame scalar stacking (locality for 3)
+        self.raw_history = deque(maxlen=3) # Stores dicts of base features
+        
         self.action_columns = self.models_with_info[0][1]['action_columns']
 
         self.action_keys = {
@@ -75,7 +78,7 @@ class EnsembleAgent:
         
         print(f"Ensemble loaded with {len(self.models_with_info)} models. Max history: {self.max_frames_needed} frames.")
 
-    def _engineer_features_inference(self, player_x, player_y, enemy_x, enemy_y):
+    def _engineer_features_inference(self, player_x, player_y, enemy_x, enemy_y, scaler=None):
         """
         Replicates the logic from train.py's engineer_features function in a stateful way.
         """
@@ -92,32 +95,70 @@ class EnsembleAgent:
         enemy_dx = enemy_x - self.last_enemy_x
         enemy_dy = enemy_y - self.last_enemy_y
         
-        # 2. Speed
+        # 2. Speed and Distance
         player_speed = np.sqrt(player_dx**2 + player_dy**2)
-        
-        # 3. Distance
         enemy_distance = np.sqrt((player_x - enemy_x)**2 + (player_y - enemy_y)**2)
+        
+        # 3. Relative
+        rel_x = enemy_x - player_x
+        rel_y = enemy_y - player_y
+        vel_diff_x = player_dx - enemy_dx
+        vel_diff_y = player_dy - enemy_dy
+        
+        # 4. Current Raw Data Point
+        current_raw = {
+            'x_position': player_x, 'y_position': player_y, 'enemy_x': enemy_x, 'enemy_y': enemy_y,
+            'player_dx': player_dx, 'player_dy': player_dy, 'enemy_dx': enemy_dx, 'enemy_dy': enemy_dy,
+            'player_speed': player_speed, 'enemy_distance': enemy_distance,
+            'rel_x': rel_x, 'rel_y': rel_y, 'vel_diff_x': vel_diff_x, 'vel_diff_y': vel_diff_y,
+            'moving_left': self.prev_actions['moving_left'], 
+            'moving_right': self.prev_actions['moving_right'],
+            'attacking': self.prev_actions['attacking'], 
+            'jumping': self.prev_actions['jumping'], 
+            'dashing': self.prev_actions['dashing']
+        }
+        
+        # Update raw history
+        self.raw_history.append(current_raw)
+        
+        # 5. Build the full 46-feature vector (Base + t1 + t2)
+        # Note: input_feature_columns in train.py excludes CURRENT actions but includes history of actions.
+        # Our current_raw['moving_left'] IS the "prev_actions" from agent perspective.
+        
+        # Base (current)
+        features = [
+            player_x, player_y, enemy_x, enemy_y,
+            player_dx, player_dy, enemy_dx, enemy_dy,
+            player_speed, enemy_distance,
+            rel_x, rel_y, vel_diff_x, vel_diff_y,
+            # We skip the 5 action labels here because the model doesn't take them as input
+        ]
+        
+        # History (t1, t2)
+        history_list = list(self.raw_history)
+        t1 = history_list[-2] if len(history_list) > 1 else history_list[-1]
+        t2 = history_list[-3] if len(history_list) > 2 else t1
+        
+        for hist_point in [t1, t2]:
+            for col in [
+                'x_position', 'y_position', 'enemy_x', 'enemy_y',
+                'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
+                'rel_x', 'rel_y', 'enemy_distance',
+                'moving_left', 'moving_right', 'attacking', 'jumping', 'dashing'
+            ]:
+                features.append(hist_point[col])
+
+        # Apply Scaling if available
+        if scaler is not None:
+            features = np.array(features).reshape(1, -1)
+            # Standardize based on fitted scaler
+            features = scaler.transform(features)[0]
         
         # Update state for next frame
         self.last_player_x = player_x
         self.last_player_y = player_y
         self.last_enemy_x = enemy_x
         self.last_enemy_y = enemy_y
-        
-        # 4. Previous Actions 
-        # Order must match train.py:
-        # ['x_position', 'y_position', 'enemy_x', 'enemy_y', 
-        #  'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
-        #  'player_speed', 'enemy_distance',
-        #  'prev_moving_left', 'prev_moving_right', 'prev_attacking', 'prev_jumping', 'prev_dashing']
-        
-        features = [
-            player_x, player_y, enemy_x, enemy_y,
-            player_dx, player_dy, enemy_dx, enemy_dy,
-            player_speed, enemy_distance,
-            self.prev_actions['moving_left'], self.prev_actions['moving_right'],
-            self.prev_actions['attacking'], self.prev_actions['jumping'], self.prev_actions['dashing']
-        ]
         
         return torch.FloatTensor(features).unsqueeze(0).to(self.device)
 
@@ -134,21 +175,18 @@ class EnsembleAgent:
             # Update Frame History
             self.frame_history.append(frame_to_use)
 
-            # --- Feature Engineering ---
-            # Check what features the first model expects
-            required_features = self.models_with_info[0][1].get('feature_columns', ['x_position', 'y_position', 'enemy_x', 'enemy_y'])
-            
-            if len(required_features) > 4:
-                # Use full engineered features with RAW coordinates
-                other_features = self._engineer_features_inference(player_x, player_y, enemy_x, enemy_y)
-            else:
-                # Fallback for legacy models
-                other_features = torch.FloatTensor([player_x, player_y, enemy_x, enemy_y]).unsqueeze(0).to(self.device)
-
             # --- Ensemble Prediction ---
             all_logits = []
             with torch.no_grad():
-                for model, info in self.models_with_info:
+                for model, info, scaler in self.models_with_info:
+                    # --- Feature Engineering per Model (to use correct scaler) ---
+                    required_features = info.get('feature_columns', ['x_position', 'y_position', 'enemy_x', 'enemy_y'])
+                    
+                    if len(required_features) > 4:
+                        other_features = self._engineer_features_inference(player_x, player_y, enemy_x, enemy_y, scaler=scaler)
+                    else:
+                        other_features = torch.FloatTensor([player_x, player_y, enemy_x, enemy_y]).unsqueeze(0).to(self.device)
+
                     target_n_frames = info.get('n_frames', 1)
                     if 'image_shape' in info and len(info['image_shape']) == 3:
                         target_n_frames = max(target_n_frames, info['image_shape'][0])

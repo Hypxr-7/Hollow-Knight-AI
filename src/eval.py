@@ -17,11 +17,143 @@ import torch
 from torch.utils.data import DataLoader
 
 # Import the correct, up-to-date classes and functions from train.py
-from train import BehavioralCloningNet, HollowKnightDataset, load_model_for_inference
+from train import BehavioralCloningNet, HollowKnightDataset, load_model_for_inference, engineer_features
 
 warnings.filterwarnings('ignore')
 
 # --- Evaluation and Plotting Functions ---
+
+class GradCAM:
+    """
+    Grad-CAM implementation for ResNet-based BehavioralCloningNet.
+    """
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+
+        # Hooks
+        self.target_layer.register_forward_hook(self.save_activation)
+        self.target_layer.register_backward_hook(self.save_gradient)
+
+    def save_activation(self, module, input, output):
+        self.activations = output
+
+    def save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+
+    def __call__(self, x, other_features, class_idx):
+        self.model.eval() 
+        
+        # Forward pass
+        output = self.model(x, other_features)
+        
+        # Zero gradients
+        self.model.zero_grad()
+        
+        # Target for backprop
+        one_hot_output = torch.FloatTensor(1, output.size(-1)).zero_().to(x.device)
+        one_hot_output[0][class_idx] = 1
+        
+        # Backward pass
+        output.backward(gradient=one_hot_output)
+        
+        # Global average pooling of gradients
+        pooled_gradients = torch.mean(self.gradients, dim=[0, 2, 3])
+        
+        # Weight activations by gradients
+        activations = self.activations.detach().clone()
+        for i in range(activations.size(1)):
+            activations[:, i, :, :] *= pooled_gradients[i]
+            
+        # Average the channels of the activations
+        heatmap = torch.mean(activations, dim=1).squeeze()
+        
+        # ReLU on top
+        heatmap = np.maximum(heatmap.cpu(), 0)
+        
+        # Normalize
+        heatmap /= torch.max(heatmap)
+        
+        return heatmap.numpy()
+
+def generate_gradcam_visualizations(model, dataset, action_columns, output_dir, device='cpu', num_samples=5, scaler=None):
+    """
+    Generates Grad-CAM heatmaps for specific actions.
+    """
+    print("Generating Grad-CAM visualizations...")
+    
+    # Target the last convolutional layer of the ResNet backbone
+    # model.resnet.layer4 is usually the last block in ResNet18
+    target_layer = model.resnet.layer4[-1].conv2
+    grad_cam = GradCAM(model, target_layer)
+    
+    model.to(device)
+    model.eval()
+    
+    # We want to find samples where the model strongly predicts an action
+    # Let's pick 'attacking' and 'jumping'
+    target_actions = ['attacking', 'jumping']
+    
+    for action_name in target_actions:
+        if action_name not in action_columns: continue
+        
+        action_idx = action_columns.index(action_name)
+        samples_found = 0
+        
+        # Shuffle dataset to get random samples
+        indices = np.random.permutation(len(dataset))
+        
+        for idx in indices:
+            if samples_found >= num_samples: break
+            
+            img, other_features, label, frame_id = dataset[idx]
+            
+            # Apply scaling to other_features if scaler is provided
+            if scaler:
+                # other_features is a tensor, scaler expects numpy (1, N)
+                feat_np = other_features.numpy().reshape(1, -1)
+                feat_scaled = scaler.transform(feat_np)[0]
+                other_features = torch.FloatTensor(feat_scaled)
+
+            # Check if this sample actually has the label
+            if label[action_idx] == 1:
+                img_tensor = img.unsqueeze(0).to(device)
+                feat_tensor = other_features.unsqueeze(0).to(device)
+                
+                # Get model prediction to confirm it's confident
+                with torch.no_grad():
+                    output = model(img_tensor, feat_tensor)
+                    prob = torch.sigmoid(output)[0][action_idx].item()
+                
+                if prob > 0.7: # Only visualize high confidence TP
+                    samples_found += 1
+                    
+                    # Generate Heatmap
+                    heatmap = grad_cam(img_tensor, feat_tensor, action_idx)
+                    
+                    # Process original image for display
+                    # Take the last frame from the stack
+                    last_frame_tensor = img[-1, :, :]
+                    original_img = (last_frame_tensor.cpu().numpy() * 255).astype(np.uint8)
+                    original_img_color = cv2.cvtColor(original_img, cv2.COLOR_GRAY2BGR)
+                    
+                    # Resize heatmap to match image size
+                    heatmap = cv2.resize(heatmap, (original_img.shape[1], original_img.shape[0]))
+                    heatmap = np.uint8(255 * heatmap)
+                    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+                    
+                    # Overlay
+                    superimposed_img = cv2.addWeighted(original_img_color, 0.6, heatmap, 0.4, 0)
+                    
+                    plt.figure(figsize=(10, 5))
+                    plt.imshow(cv2.cvtColor(superimposed_img, cv2.COLOR_BGR2RGB))
+                    plt.title(f"Grad-CAM: {action_name} (Prob: {prob:.2f})\nFrame: {frame_id}")
+                    plt.axis('off')
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(output_dir, f'12_gradcam_{action_name}_{samples_found}.png'))
+                    plt.close()
 
 def get_predictions(models_with_info, master_df, device='cpu'):
     """
@@ -34,15 +166,15 @@ def get_predictions(models_with_info, master_df, device='cpu'):
     final_frame_ids = None
 
     class TempEvalDataset(HollowKnightDataset):
-        def __init__(self, data_df, image_size, n_frames):
-            super().__init__(data_df=data_df, image_size=image_size, n_frames=n_frames)
+        def __init__(self, data_df, image_size, n_frames, feature_columns):
+            super().__init__(data_df=data_df, image_size=image_size, n_frames=n_frames, feature_columns=feature_columns)
 
         def __getitem__(self, idx):
             img, other_features, actions = super().__getitem__(idx)
             frame_id = self.data.iloc[idx]['frame_id']
             return img, other_features, actions, frame_id
 
-    for i, (model, info) in enumerate(models_with_info):
+    for i, (model, info, scaler) in enumerate(models_with_info):
         print(f"--- Processing Model {i+1}/{len(models_with_info)} ---")
         model.to(device)
         model.eval()
@@ -55,29 +187,39 @@ def get_predictions(models_with_info, master_df, device='cpu'):
         target_h = info['image_shape'][1]
         target_w = info['image_shape'][2]
         image_size = (target_w, target_h) # PIL uses (W, H)
+        feature_columns = info.get('feature_columns', ['x_position', 'y_position', 'enemy_x', 'enemy_y'])
 
         print(f"Using image size: {image_size}, n_frames: {n_frames}")
 
-        temp_dataset = TempEvalDataset(data_df=master_df.copy(), image_size=image_size, n_frames=n_frames)
+        temp_dataset = TempEvalDataset(data_df=master_df.copy(), image_size=image_size, n_frames=n_frames, feature_columns=feature_columns)
         temp_loader = DataLoader(temp_dataset, batch_size=64, shuffle=False)
         
         current_model_labels, current_model_preds, current_model_frame_ids, current_model_embeddings = [], [], [], []
 
         with torch.no_grad():
             for images, other_features, labels, frame_ids in tqdm(temp_loader, desc=f"Model {i+1} Predictions"):
-                images, other_features, labels = images.to(device), other_features.to(device), labels.to(device)
+                images, labels = images.to(device), labels.to(device)
                 
-                # Manually run forward pass to get embeddings
-                x = model.pool(torch.nn.functional.relu(model.bn1(model.conv1(images))))
-                x = model.pool(torch.nn.functional.relu(model.bn2(model.conv2(x))))
-                x = x.view(x.size(0), -1)
+                # Apply scaling
+                if scaler:
+                    # other_features is tensor (Batch, Features)
+                    # Convert to numpy, transform, back to tensor
+                    feat_np = other_features.numpy()
+                    feat_scaled = scaler.transform(feat_np)
+                    other_features = torch.FloatTensor(feat_scaled).to(device)
+                else:
+                    other_features = other_features.to(device)
+
+                # Manually run forward pass to get embeddings (ResNet specific)
+                x = model.resnet(images) # (Batch, 512) 
+                
                 combined = torch.cat([x, other_features], dim=1)
                 
                 # Get embedding (penultimate layer output)
-                embedding = torch.nn.functional.relu(model.bn3(model.fc1(combined)))
+                embedding = torch.nn.functional.relu(model.bn1(model.fusion_fc(combined)))
                 
                 # Get final prediction
-                output = model.fc2(model.dropout(embedding))
+                output = model.final_fc(model.dropout(embedding))
                 probabilities = torch.sigmoid(output)
 
                 current_model_labels.append(labels.cpu().numpy())
@@ -259,7 +401,7 @@ def visualize_similar_images(true_labels, embeddings, frame_ids, frame_id_to_pat
                     axes[1].set_title(f'Frame {frame_id_j}\nActions: {actions_j}')
                     axes[1].axis('off')
                     
-                    plt.suptitle(f'Similarity: {sim_matrix[i, j]:.2f} (> {threshold*100}%) with Different Labels')
+                    plt.suptitle(f'Similarity: {sim_matrix[i, j]:.2f} (> {threshold*100}% ) with Different Labels')
                     plt.savefig(os.path.join(output_dir, f'11_similar_images_{threshold*100}pct_{pairs_found}.png'))
                     plt.close()
 
@@ -281,14 +423,15 @@ def main():
 
     models_with_info = []
     for model_dir in ensemble_dirs:
-        model, info = load_model_for_inference(model_dir)
-        models_with_info.append((model, info))
+        model, info, scaler, pca = load_model_for_inference(model_dir)
+        models_with_info.append((model, info, scaler, pca))
 
     if not models_with_info:
         print("No models were successfully loaded. Exiting.")
         return
         
     action_columns = models_with_info[0][1]['action_columns']
+    feature_columns = models_with_info[0][1].get('feature_columns')
     print(f"Loaded {len(models_with_info)} models.")
 
     csv_files = [f for f in os.listdir(DATA_DIR) if f.startswith('hk_actions_') and f.endswith('.csv')]
@@ -300,19 +443,52 @@ def main():
                 lambda x: os.path.join(DATA_DIR, f'frames_{sid}', f"frame_{x:06d}.png")
             )
         )
-        for csv_file in data_to_load if os.path.exists(os.path.join(DATA_DIR, f'frames_{csv_file.replace("hk_actions_", "").replace(".csv", "")}'))
+        for csv_file in data_to_load if os.path.exists(os.path.join(DATA_DIR, f'frames_{csv_file.replace("hk_actions_", "").replace(".csv", "")}') )
     ], ignore_index=True)
+    
+    # Pre-calculate features just like in training
+    master_df = engineer_features(master_df)
 
     if master_df.empty:
-        print("No data could be loaded for evaluation."); return
+        print("No data could be loaded for evaluation"); return
         
     true_labels, pred_probs, frame_ids, embeddings = get_predictions(models_with_info, master_df)
     print(f"Got predictions for {len(true_labels)} samples.")
     
-    temp_dataset = HollowKnightDataset(data_df=master_df.copy(), image_size=None)
-    frame_id_to_path = pd.Series(temp_dataset.data.frame_path.values, index=temp_dataset.data.frame_id).to_dict()
+    # Use the first model to generate Grad-CAMs
+    # We need a Dataset that returns frame_id as part of item to match logic
+    class EvalDataset(HollowKnightDataset):
+        def __init__(self, data_df, image_size, n_frames, feature_columns):
+            super().__init__(data_df=data_df, image_size=image_size, n_frames=n_frames, feature_columns=feature_columns)
+        def __getitem__(self, idx):
+            img, other_features, actions = super().__getitem__(idx)
+            frame_id = self.data.iloc[idx]['frame_id']
+            return img, other_features, actions, frame_id
+            
+    first_model, first_info, first_scaler, first_pca = models_with_info[0]
+    n_frames = first_info.get('n_frames', 1)
+    image_size = tuple(first_info['image_shape'][1:][::-1]) # (W, H)
+    
+    # Pre-process GradCAM Data
+    df_gradcam = master_df.copy()
+    X_gc = df_gradcam[RAW_FEATURE_COLUMNS].values
+    if first_scaler:
+        X_gc = first_scaler.transform(X_gc)
+    if first_pca:
+        X_gc = first_pca.transform(X_gc)
+        pca_cols = [f'pca_{k}' for k in range(X_gc.shape[1])]
+        df_gradcam = pd.concat([df_gradcam, pd.DataFrame(X_gc, columns=pca_cols, index=df_gradcam.index)], axis=1)
+    else:
+        df_gradcam[RAW_FEATURE_COLUMNS] = X_gc
+
+    gradcam_dataset = EvalDataset(df_gradcam, image_size=image_size, n_frames=n_frames, feature_columns=first_info['feature_columns'])
+    generate_gradcam_visualizations(first_model, gradcam_dataset, action_columns, OUTPUT_DIR, scaler=None)
 
     print("Generating plots...")
+    # Re-using a generic dataset for plotting utils that don't need scaling/tensors
+    temp_dataset = HollowKnightDataset(data_df=master_df.copy(), image_size=None, feature_columns=None)
+    frame_id_to_path = pd.Series(temp_dataset.data.frame_path.values, index=temp_dataset.data.frame_id).to_dict()
+
     plot_class_distribution(temp_dataset.data, action_columns, OUTPUT_DIR)
     print("1, 2. Class distribution plots generated.")
     plot_violin(true_labels, pred_probs, action_columns, OUTPUT_DIR)
