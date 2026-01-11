@@ -294,6 +294,8 @@ namespace DataCollector
             {
                 MovingLeft = actionStates.MovingLeft,
                 MovingRight = actionStates.MovingRight,
+                MovingUp = actionStates.MovingUp,
+                MovingDown = actionStates.MovingDown,
                 Attacking = actionStates.Attacking,
                 Jumping = actionStates.Jumping,
                 Dashing = actionStates.Dashing
@@ -326,6 +328,8 @@ namespace DataCollector
             {
                 MovingLeft = input.Horizontal < -deadzoneThreshold || Input.GetKey(KeyCode.Joystick1Button14),
                 MovingRight = input.Horizontal > deadzoneThreshold || Input.GetKey(KeyCode.Joystick1Button15),
+                MovingUp = input.Vertical > deadzoneThreshold,
+                MovingDown = input.Vertical < -deadzoneThreshold,
                 Attacking = heroController.cState.attacking,
                 Jumping = heroController.cState.jumping,
                 Dashing = heroController.cState.dashing
@@ -378,7 +382,7 @@ namespace DataCollector
         {
             return $"{frameCount},{player.Position.x:F3},{player.Position.y:F3}," +
                    $"{enemy.Position.x:F3},{enemy.Position.y:F3}," +
-                   $"{input.MovingLeft},{input.MovingRight}," +
+                   $"{input.MovingLeft},{input.MovingRight},{input.MovingUp},{input.MovingDown}," +
                    $"{input.Attacking},{input.Jumping},{input.Dashing}";
         }
         #endregion
@@ -421,7 +425,7 @@ namespace DataCollector
         private void WriteCSVHeader()
         {
             const string header = "frame_id,x_position,y_position,enemy_x,enemy_y," +
-                                "moving_left,moving_right," +
+                                "moving_left,moving_right,moving_up,moving_down," +
                                 "attacking,jumping,dashing";
             File.WriteAllText(csvFilePath, header + "\n");
         }
@@ -438,6 +442,8 @@ namespace DataCollector
         {
             public bool MovingLeft { get; set; }
             public bool MovingRight { get; set; }
+            public bool MovingUp { get; set; }
+            public bool MovingDown { get; set; }
             public bool Attacking { get; set; }
             public bool Jumping { get; set; }
             public bool Dashing { get; set; }
@@ -465,9 +471,17 @@ namespace DataCollector
         {
             public bool MovingLeft { get; set; }
             public bool MovingRight { get; set; }
+            public bool MovingUp { get; set; }
+            public bool MovingDown { get; set; }
             public bool Attacking { get; set; }
             public bool Jumping { get; set; }
             public bool Dashing { get; set; }
+        }
+
+        private class ScaleDimensions
+        {
+            public int Width { get; set; }
+            public int Height { get; set; }
         }
         #endregion
     }

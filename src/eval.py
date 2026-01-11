@@ -423,8 +423,8 @@ def main():
 
     models_with_info = []
     for model_dir in ensemble_dirs:
-        model, info, scaler, pca = load_model_for_inference(model_dir)
-        models_with_info.append((model, info, scaler, pca))
+        model, info, scaler = load_model_for_inference(model_dir)
+        models_with_info.append((model, info, scaler))
 
     if not models_with_info:
         print("No models were successfully loaded. Exiting.")
@@ -465,21 +465,25 @@ def main():
             frame_id = self.data.iloc[idx]['frame_id']
             return img, other_features, actions, frame_id
             
-    first_model, first_info, first_scaler, first_pca = models_with_info[0]
+    first_model, first_info, first_scaler = models_with_info[0]
     n_frames = first_info.get('n_frames', 1)
     image_size = tuple(first_info['image_shape'][1:][::-1]) # (W, H)
     
     # Pre-process GradCAM Data
     df_gradcam = master_df.copy()
-    X_gc = df_gradcam[RAW_FEATURE_COLUMNS].values
+    
+    # We need to scale the features manually for GradCAM dataset because we are creating it directly
     if first_scaler:
-        X_gc = first_scaler.transform(X_gc)
-    if first_pca:
-        X_gc = first_pca.transform(X_gc)
-        pca_cols = [f'pca_{k}' for k in range(X_gc.shape[1])]
-        df_gradcam = pd.concat([df_gradcam, pd.DataFrame(X_gc, columns=pca_cols, index=df_gradcam.index)], axis=1)
-    else:
-        df_gradcam[RAW_FEATURE_COLUMNS] = X_gc
+        # We need to find which columns correspond to the scaler
+        # In train.py we fit on 'input_feature_columns'
+        # In model_info, 'feature_columns' SHOULD be the input columns used
+        cols_to_scale = first_info['feature_columns']
+        # Check if they exist
+        existing_cols = [c for c in cols_to_scale if c in df_gradcam.columns]
+        if len(existing_cols) == len(cols_to_scale):
+            df_gradcam[cols_to_scale] = first_scaler.transform(df_gradcam[cols_to_scale])
+        else:
+            print("Warning: Could not match columns for scaling in GradCAM. Skipping scaling.")
 
     gradcam_dataset = EvalDataset(df_gradcam, image_size=image_size, n_frames=n_frames, feature_columns=first_info['feature_columns'])
     generate_gradcam_visualizations(first_model, gradcam_dataset, action_columns, OUTPUT_DIR, scaler=None)

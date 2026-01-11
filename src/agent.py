@@ -59,6 +59,7 @@ class EnsembleAgent:
         self.last_enemy_y = None
         self.prev_actions = {
             'moving_left': 0.0, 'moving_right': 0.0, 
+            'moving_up': 0.0, 'moving_down': 0.0,
             'attacking': 0.0, 'jumping': 0.0, 'dashing': 0.0
         }
         
@@ -69,6 +70,7 @@ class EnsembleAgent:
 
         self.action_keys = {
             'moving_left': 'left', 'moving_right': 'right',
+            'moving_up': 'up', 'moving_down': 'down',
             'attacking': 'x', 'jumping': 'z', 'dashing': 'c'
         }
         self.pressed_keys = set()
@@ -113,6 +115,8 @@ class EnsembleAgent:
             'rel_x': rel_x, 'rel_y': rel_y, 'vel_diff_x': vel_diff_x, 'vel_diff_y': vel_diff_y,
             'moving_left': self.prev_actions['moving_left'], 
             'moving_right': self.prev_actions['moving_right'],
+            'moving_up': self.prev_actions['moving_up'],
+            'moving_down': self.prev_actions['moving_down'],
             'attacking': self.prev_actions['attacking'], 
             'jumping': self.prev_actions['jumping'], 
             'dashing': self.prev_actions['dashing']
@@ -144,7 +148,7 @@ class EnsembleAgent:
                 'x_position', 'y_position', 'enemy_x', 'enemy_y',
                 'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
                 'rel_x', 'rel_y', 'enemy_distance',
-                'moving_left', 'moving_right', 'attacking', 'jumping', 'dashing'
+                'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing'
             ]:
                 features.append(hist_point[col])
 
@@ -220,6 +224,7 @@ class EnsembleAgent:
             # --- Update State for Next Frame ---
             thresholds = {
                 'moving_left': 0.5, 'moving_right': 0.5,
+                'moving_up': 0.5, 'moving_down': 0.5,
                 'attacking': 0.5, 'jumping': 0.5, 'dashing': 0.5
             }
             
@@ -253,7 +258,7 @@ class EnsembleAgent:
                 else:
                     desired_holds.add(action_key)
 
-        # Handle mutual exclusion for movement
+        # Handle mutual exclusion for movement (Left/Right)
         if 'left' in desired_holds and 'right' in desired_holds:
             if predictions[self.action_columns.index('moving_left')] > predictions[self.action_columns.index('moving_right')]:
                 desired_holds.discard('right')
@@ -261,6 +266,15 @@ class EnsembleAgent:
             else:
                 desired_holds.discard('left')
                 if 'moving_left' in active_actions: active_actions.remove('moving_left')
+
+        # Handle mutual exclusion for movement (Up/Down)
+        if 'up' in desired_holds and 'down' in desired_holds:
+            if predictions[self.action_columns.index('moving_up')] > predictions[self.action_columns.index('moving_down')]:
+                desired_holds.discard('down')
+                if 'moving_down' in active_actions: active_actions.remove('moving_down')
+            else:
+                desired_holds.discard('up')
+                if 'moving_up' in active_actions: active_actions.remove('moving_up')
         
         # Update held keys
         keys_to_release = self.pressed_keys - desired_holds
