@@ -1,6 +1,46 @@
-.venv
-bin
-HKData
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Build artifacts
+bin/
+obj/
+*.exe
+*.dll
+*.so
+*.pdb
+
+# Data (Large binary files)
+HKData/
+*.raw
+
+# Logs and temporary training data
+runs/
+.tensorboard/
+
+# Evaluation results
+evaluation_results/
+
+# Modding specific
 GEMINI.MD
-obj
-evaluation_results
+test_report.json
+
+# VS Code
+.vscode/
+!.vscode/tasks.json
+
+# Python
+
+__pycache__/
+
+*.py[cod]
+
+*$py.class
+
+
+
+# Models (Ignored due to size)
+
+model/

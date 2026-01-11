@@ -409,10 +409,9 @@ namespace DataCollector
                             File.AppendAllText(csvFilePath, frame.CsvRow + "\n");
                         }
                     }
-                    catch (Exception ex)
+                    catch
                     {
-                        // Cannot Log() from thread easily in some Unity versions, but we can try
-                        // or just silent fail to keep thread alive
+                        // Background thread error - silent to prevent crash
                     }
                 }
                 else
