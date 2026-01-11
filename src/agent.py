@@ -219,8 +219,8 @@ class EnsembleAgent:
 
             # --- Update State for Next Frame ---
             thresholds = {
-                'moving_left': 0.17, 'moving_right': 0.17,
-                'attacking': 0.17, 'jumping': 0.17, 'dashing': 0.17
+                'moving_left': 0.5, 'moving_right': 0.5,
+                'attacking': 0.5, 'jumping': 0.5, 'dashing': 0.5
             }
             
             for i, col in enumerate(self.action_columns):

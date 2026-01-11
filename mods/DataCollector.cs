@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.IO;
+using System.Threading;
 using Modding;
 using UnityEngine;
 
@@ -16,10 +18,9 @@ namespace DataCollector
         private readonly int targetWidth = 640;
         private readonly int targetHeight = 360;
 
-        // Recording settings
-        private readonly float csvRecordingInterval = 1f / 3f; // 3 FPS
+        // Recording settings - Target 30 FPS
+        private readonly float csvRecordingInterval = 1f / 30f; 
         private readonly float deadzoneThreshold = 0.5f;
-        private readonly int bufferSaveThreshold = 100;
         #endregion
 
         #region Recording State
@@ -34,18 +35,40 @@ namespace DataCollector
         private string framesDirectoryPath;
         #endregion
 
-        #region Data Management
-        private readonly List<string> dataBuffer = new List<string>();
+        #region Threading & Data
+        private ConcurrentQueue<FrameData> writeQueue = new ConcurrentQueue<FrameData>();
+        private Thread writeThread;
+        private bool threadRunning = false;
+        private readonly object fileLock = new object();
+
+        private struct FrameData
+        {
+            public int FrameId;
+            public byte[] RawData;
+            public string CsvRow;
+            public int Width;
+            public int Height;
+        }
+        #endregion
+
+        #region Reusable Resources
+        private Texture2D screenTexture;
+        private Texture2D resizedTexture;
+        private RenderTexture renderTexture;
         #endregion
 
         #region Constructor and Initialization
         public DataCollectorMod() : base("Data Collector") { }
 
-        public override string GetVersion() => "T3.0";
+        public override string GetVersion() => "4.0";
 
         public override void Initialize()
         {
             ModHooks.HeroUpdateHook += OnHeroUpdate;
+            
+            // Initialize reusable textures once
+            // Note: Screen size might change, ideally check this, but for now assume fixed
+            InitializeTextures(Screen.width, Screen.height);
 
             try
             {
@@ -56,6 +79,17 @@ namespace DataCollector
             {
                 Log($"Error initializing mod: {ex.Message}");
             }
+        }
+
+        private void InitializeTextures(int screenWidth, int screenHeight)
+        {
+            if (screenTexture != null) UnityEngine.Object.Destroy(screenTexture);
+            if (resizedTexture != null) UnityEngine.Object.Destroy(resizedTexture);
+            if (renderTexture != null) renderTexture.Release();
+
+            screenTexture = new Texture2D(screenWidth, screenHeight, TextureFormat.RGB24, false);
+            resizedTexture = new Texture2D(targetWidth, targetHeight, TextureFormat.RGB24, false);
+            renderTexture = new RenderTexture(targetWidth, targetHeight, 24);
         }
 
         private void CreateMainSaveDirectory()
@@ -100,8 +134,7 @@ namespace DataCollector
 
             if (recordingTimer >= csvRecordingInterval)
             {
-                CapturePlayerData();
-                CaptureScreenFrame();
+                CaptureFrame();
                 recordingTimer = 0f;
             }
         }
@@ -115,8 +148,14 @@ namespace DataCollector
             WriteCSVHeader();
             ResetSessionState();
 
+            // Start Worker Thread
+            threadRunning = true;
+            writeThread = new Thread(WriteLoop);
+            writeThread.IsBackground = true;
+            writeThread.Start();
+
             isRecording = true;
-            Log("Recording session started!");
+            Log("Recording session started! (Threaded)");
         }
 
         private void InitializeSessionPaths()
@@ -138,22 +177,33 @@ namespace DataCollector
         private void ResetSessionState()
         {
             frameCount = 0;
-            dataBuffer.Clear();
+            // Clear queue logic if needed, but new session new queue usually fine
+            while(writeQueue.TryDequeue(out _)); 
         }
 
         private void StopCurrentSession()
         {
             isRecording = false;
-            SaveRemainingBufferedData();
+            
+            // Allow thread to finish buffer
+            // In a real scenario, we might want to wait or signal end
+            // For now, we let the thread run until queue empty then stop
+            
+            // We'll set a flag or just let it finish in background?
+            // Safer to let it run. But we need to know when to stop.
+            // Simplified: We stop adding, thread keeps processing until empty.
+            
+            Log("Stopping recording... saving remaining frames.");
+            
+            // We can leave the thread running to drain, or join. 
+            // Since it's a game, we don't want to freeze. 
+            // We will signal the thread to stop when empty.
+            
+            // The WriteLoop checks 'threadRunning' and 'queue.Count'.
+            // We set threadRunning = false, but WriteLoop will continue until queue is empty.
+            threadRunning = false; 
+            
             LogSessionSummary();
-        }
-
-        private void SaveRemainingBufferedData()
-        {
-            if (dataBuffer.Count > 0)
-            {
-                SaveBufferedData();
-            }
         }
 
         private void LogSessionSummary()
@@ -165,29 +215,60 @@ namespace DataCollector
         #endregion
 
         #region Data Capture
-        private void CapturePlayerData()
+        private void CaptureFrame()
         {
             try
             {
+                // 1. Capture Game Data
                 var playerData = GetPlayerData();
                 if (playerData == null) return;
-
                 var inputData = GetInputData();
                 var enemyData = GetEnemyData();
+                string csvRow = FormatDataRow(playerData, inputData, enemyData);
 
-                string dataRow = FormatDataRow(playerData, inputData, enemyData);
+                // 2. Capture Screen Data (Main Thread)
+                // Check if screen resolution changed
+                if (screenTexture.width != Screen.width || screenTexture.height != Screen.height)
+                {
+                    InitializeTextures(Screen.width, Screen.height);
+                }
 
-                dataBuffer.Add(dataRow);
+                // Read full screen
+                screenTexture.ReadPixels(new Rect(0, 0, Screen.width, Screen.height), 0, 0);
+                screenTexture.Apply();
+
+                // Downscale using GPU (Blit)
+                Graphics.Blit(screenTexture, renderTexture);
+                
+                // Read back small texture
+                RenderTexture.active = renderTexture;
+                resizedTexture.ReadPixels(new Rect(0, 0, targetWidth, targetHeight), 0, 0);
+                resizedTexture.Apply();
+                RenderTexture.active = null;
+
+                // Get raw bytes - FAST, just a copy
+                byte[] rawBytes = resizedTexture.GetRawTextureData();
+
+                // 3. Enqueue
+                writeQueue.Enqueue(new FrameData 
+                { 
+                    FrameId = frameCount, 
+                    RawData = rawBytes, 
+                    CsvRow = csvRow,
+                    Width = targetWidth,
+                    Height = targetHeight
+                });
+
                 frameCount++;
-
-                SaveBufferIfNeeded();
             }
             catch (Exception ex)
             {
-                Log($"Error capturing data: {ex.Message}");
+                Log($"Error capturing frame: {ex.Message}");
             }
         }
-
+        
+        // ... (Keep existing Data Helper methods: GetPlayerData, GetInputData, etc.) ...
+        
         private PlayerDataSnapshot GetPlayerData()
         {
             var heroController = HeroController.instance;
@@ -208,8 +289,6 @@ namespace DataCollector
             var rawInput = GetRawInputAxes();
             var processedInput = ApplyDeadzoneCorrection(rawInput);
             var actionStates = GetActionStates(processedInput);
-
-            LogDeadzoneCorrection(rawInput, frameCount);
 
             return new InputDataSnapshot
             {
@@ -253,14 +332,6 @@ namespace DataCollector
             };
         }
 
-        private void LogDeadzoneCorrection(RawInputAxes raw, int currentFrame)
-        {
-            if (currentFrame % 30 == 0)
-            {
-                Log($"Deadzone applied - Raw H:{raw.Horizontal:F3} | Raw V:{raw.Vertical:F3}");
-            }
-        }
-
         private EnemyDataSnapshot GetEnemyData()
         {
             var enemy = FindCurrentEnemy();
@@ -272,45 +343,22 @@ namespace DataCollector
                 Enemy = enemy
             };
         }
-
-        private string FormatDataRow(PlayerDataSnapshot player, InputDataSnapshot input, EnemyDataSnapshot enemy)
-        {
-            return $"{frameCount},{player.Position.x:F3},{player.Position.y:F3}," +
-                   $"{enemy.Position.x:F3},{enemy.Position.y:F3}," +
-                   $"{input.MovingLeft},{input.MovingRight}," +
-                   $"{input.Attacking},{input.Jumping},{input.Dashing}";
-        }
-
-        private void SaveBufferIfNeeded()
-        {
-            if (dataBuffer.Count >= bufferSaveThreshold)
-            {
-                SaveBufferedData();
-            }
-        }
-        #endregion
-
-        #region Enemy Detection
+        
         private GameObject FindCurrentEnemy()
         {
             try
             {
                 var healthManagers = GameObject.FindObjectsOfType<HealthManager>();
                 if (healthManagers.Length == 0) return null;
-
                 return FindClosestEnemyToPlayer(healthManagers);
             }
-            catch
-            {
-                return null;
-            }
+            catch { return null; }
         }
 
         private GameObject FindClosestEnemyToPlayer(HealthManager[] healthManagers)
         {
             var hero = HeroController.instance;
             Vector3 heroPos = hero?.transform.position ?? Vector3.zero;
-
             HealthManager closest = null;
             float minDistance = float.MaxValue;
 
@@ -323,127 +371,48 @@ namespace DataCollector
                     closest = healthManager;
                 }
             }
-
             return closest?.gameObject;
+        }
+
+        private string FormatDataRow(PlayerDataSnapshot player, InputDataSnapshot input, EnemyDataSnapshot enemy)
+        {
+            return $"{frameCount},{player.Position.x:F3},{player.Position.y:F3}," +
+                   $"{enemy.Position.x:F3},{enemy.Position.y:F3}," +
+                   $"{input.MovingLeft},{input.MovingRight}," +
+                   $"{input.Attacking},{input.Jumping},{input.Dashing}";
         }
         #endregion
 
-        #region Screen Capture
-        private void CaptureScreenFrame()
+        #region Threaded Worker
+        private void WriteLoop()
         {
-            try
+            while (threadRunning || !writeQueue.IsEmpty)
             {
-                EnsureFramesDirectoryExists();
-
-                var screenshot = CaptureAndScaleScreen();
-                if (screenshot != null)
+                if (writeQueue.TryDequeue(out FrameData frame))
                 {
-                    SaveScreenshotFrame(screenshot);
-                    UnityEngine.Object.Destroy(screenshot);
+                    try
+                    {
+                        // Save Raw Bytes
+                        string framePath = Path.Combine(framesDirectoryPath, $"frame_{frame.FrameId:D6}.raw");
+                        File.WriteAllBytes(framePath, frame.RawData);
+
+                        // Append CSV Row
+                        // We use a lock just in case, though this is the only writer thread
+                        lock (fileLock)
+                        {
+                            File.AppendAllText(csvFilePath, frame.CsvRow + "\n");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Cannot Log() from thread easily in some Unity versions, but we can try
+                        // or just silent fail to keep thread alive
+                    }
                 }
-            }
-            catch (Exception ex)
-            {
-                HandleScreenCaptureError(ex);
-            }
-        }
-
-        private void EnsureFramesDirectoryExists()
-        {
-            if (!Directory.Exists(framesDirectoryPath))
-            {
-                Directory.CreateDirectory(framesDirectoryPath);
-                Log($"Created frames directory: {framesDirectoryPath}");
-            }
-        }
-
-        private Texture2D CaptureAndScaleScreen()
-        {
-            var fullScreenshot = CaptureFullScreen();
-            var scaledScreenshot = CreateScaledScreenshot(fullScreenshot);
-
-            UnityEngine.Object.Destroy(fullScreenshot);
-            return scaledScreenshot;
-        }
-
-        private Texture2D CaptureFullScreen()
-        {
-            int screenWidth = Screen.width;
-            int screenHeight = Screen.height;
-
-            var screenshot = new Texture2D(screenWidth, screenHeight, TextureFormat.RGB24, false);
-            screenshot.ReadPixels(new Rect(0, 0, screenWidth, screenHeight), 0, 0);
-            screenshot.Apply();
-
-            return screenshot;
-        }
-
-        private Texture2D CreateScaledScreenshot(Texture2D fullScreenshot)
-        {
-            var scaleDimensions = CalculateScaleDimensions();
-
-            var renderTexture = RenderTexture.GetTemporary(scaleDimensions.Width, scaleDimensions.Height);
-            Graphics.Blit(fullScreenshot, renderTexture);
-
-            var scaledScreenshot = new Texture2D(scaleDimensions.Width, scaleDimensions.Height, TextureFormat.RGB24, false);
-            RenderTexture.active = renderTexture;
-            scaledScreenshot.ReadPixels(new Rect(0, 0, scaleDimensions.Width, scaleDimensions.Height), 0, 0);
-            scaledScreenshot.Apply();
-            RenderTexture.active = null;
-
-            RenderTexture.ReleaseTemporary(renderTexture);
-            return scaledScreenshot;
-        }
-
-        private ScaleDimensions CalculateScaleDimensions()
-        {
-            int screenWidth = Screen.width;
-            int screenHeight = Screen.height;
-
-            float scale = Mathf.Min((float)targetWidth / screenWidth, (float)targetHeight / screenHeight);
-
-            return new ScaleDimensions
-            {
-                Width = Mathf.RoundToInt(screenWidth * scale),
-                Height = Mathf.RoundToInt(screenHeight * scale)
-            };
-        }
-
-        private void SaveScreenshotFrame(Texture2D screenshot)
-        {
-            byte[] frameData = screenshot.EncodeToPNG();
-            string framePath = Path.Combine(framesDirectoryPath, $"frame_{frameCount:D6}.png");
-
-            EnsureDirectoryExists(Path.GetDirectoryName(framePath));
-            File.WriteAllBytes(framePath, frameData);
-        }
-
-        private void EnsureDirectoryExists(string directoryPath)
-        {
-            if (!Directory.Exists(directoryPath))
-            {
-                Directory.CreateDirectory(directoryPath);
-            }
-        }
-
-        private void HandleScreenCaptureError(Exception ex)
-        {
-            Log($"Error capturing frame: {ex.Message}");
-            Log($"Attempted path: {framesDirectoryPath}");
-
-            TryRecreateFramesDirectory();
-        }
-
-        private void TryRecreateFramesDirectory()
-        {
-            try
-            {
-                Directory.CreateDirectory(framesDirectoryPath);
-                Log("Recreated frames directory");
-            }
-            catch (Exception dirEx)
-            {
-                Log($"Failed to create directory: {dirEx.Message}");
+                else
+                {
+                    Thread.Sleep(5); // Sleep to save CPU when empty
+                }
             }
         }
         #endregion
@@ -455,34 +424,6 @@ namespace DataCollector
                                 "moving_left,moving_right," +
                                 "attacking,jumping,dashing";
             File.WriteAllText(csvFilePath, header + "\n");
-        }
-
-        private void SaveBufferedData()
-        {
-            try
-            {
-                if (dataBuffer.Count > 0)
-                {
-                    EnsureCSVDirectoryExists();
-                    File.AppendAllLines(csvFilePath, dataBuffer);
-                    dataBuffer.Clear();
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"Error saving CSV data: {ex.Message}");
-                Log($"Attempted path: {csvFilePath}");
-            }
-        }
-
-        private void EnsureCSVDirectoryExists()
-        {
-            string csvDirectory = Path.GetDirectoryName(csvFilePath);
-            if (!Directory.Exists(csvDirectory))
-            {
-                Directory.CreateDirectory(csvDirectory);
-                Log($"Created CSV directory: {csvDirectory}");
-            }
         }
         #endregion
 
@@ -527,12 +468,6 @@ namespace DataCollector
             public bool Attacking { get; set; }
             public bool Jumping { get; set; }
             public bool Dashing { get; set; }
-        }
-
-        private class ScaleDimensions
-        {
-            public int Width { get; set; }
-            public int Height { get; set; }
         }
         #endregion
     }
