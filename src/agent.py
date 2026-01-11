@@ -52,6 +52,9 @@ class EnsembleAgent:
         # Buffer to store the last N raw frames
         self.frame_history = deque(maxlen=self.max_frames_needed)
         
+        # Hidden states for LSTM (one per model)
+        self.hidden_states = [None] * len(self.models_with_info)
+        
         # State tracking for feature engineering
         self.last_player_x = None
         self.last_player_y = None
@@ -60,7 +63,7 @@ class EnsembleAgent:
         self.prev_actions = {
             'moving_left': 0.0, 'moving_right': 0.0, 
             'moving_up': 0.0, 'moving_down': 0.0,
-            'attacking': 0.0, 'jumping': 0.0, 'dashing': 0.0
+            'attacking': 0.0, 'jumping': 0.0, 'dashing': 0.0, 'casting': 0.0
         }
         
         # Maintain history of raw metrics for 3-frame scalar stacking (locality for 3)
@@ -71,7 +74,7 @@ class EnsembleAgent:
         self.action_keys = {
             'moving_left': 'left', 'moving_right': 'right',
             'moving_up': 'up', 'moving_down': 'down',
-            'attacking': 'x', 'jumping': 'z', 'dashing': 'c'
+            'attacking': 'x', 'jumping': 'z', 'dashing': 'c', 'casting': 'a'
         }
         self.pressed_keys = set()
         
@@ -80,7 +83,7 @@ class EnsembleAgent:
         
         print(f"Ensemble loaded with {len(self.models_with_info)} models. Max history: {self.max_frames_needed} frames.")
 
-    def _engineer_features_inference(self, player_x, player_y, enemy_x, enemy_y, scaler=None):
+    def _engineer_features_inference(self, player_x, player_y, player_health, enemy_x, enemy_y, scaler=None):
         """
         Replicates the logic from train.py's engineer_features function in a stateful way.
         """
@@ -109,7 +112,8 @@ class EnsembleAgent:
         
         # 4. Current Raw Data Point
         current_raw = {
-            'x_position': player_x, 'y_position': player_y, 'enemy_x': enemy_x, 'enemy_y': enemy_y,
+            'x_position': player_x, 'y_position': player_y, 'health': player_health, 
+            'enemy_x': enemy_x, 'enemy_y': enemy_y,
             'player_dx': player_dx, 'player_dy': player_dy, 'enemy_dx': enemy_dx, 'enemy_dy': enemy_dy,
             'player_speed': player_speed, 'enemy_distance': enemy_distance,
             'rel_x': rel_x, 'rel_y': rel_y, 'vel_diff_x': vel_diff_x, 'vel_diff_y': vel_diff_y,
@@ -119,7 +123,8 @@ class EnsembleAgent:
             'moving_down': self.prev_actions['moving_down'],
             'attacking': self.prev_actions['attacking'], 
             'jumping': self.prev_actions['jumping'], 
-            'dashing': self.prev_actions['dashing']
+            'dashing': self.prev_actions['dashing'],
+            'casting': self.prev_actions['casting']
         }
         
         # Update raw history
@@ -131,7 +136,7 @@ class EnsembleAgent:
         
         # Base (current)
         features = [
-            player_x, player_y, enemy_x, enemy_y,
+            player_x, player_y, player_health, enemy_x, enemy_y,
             player_dx, player_dy, enemy_dx, enemy_dy,
             player_speed, enemy_distance,
             rel_x, rel_y, vel_diff_x, vel_diff_y,
@@ -145,10 +150,10 @@ class EnsembleAgent:
         
         for hist_point in [t1, t2]:
             for col in [
-                'x_position', 'y_position', 'enemy_x', 'enemy_y',
+                'x_position', 'y_position', 'health', 'enemy_x', 'enemy_y',
                 'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
                 'rel_x', 'rel_y', 'enemy_distance',
-                'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing'
+                'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting'
             ]:
                 features.append(hist_point[col])
 
@@ -166,7 +171,7 @@ class EnsembleAgent:
         
         return torch.FloatTensor(features).unsqueeze(0).to(self.device)
 
-    def predict_from_bytes(self, image_bytes, width, height, player_x, player_y, enemy_x, enemy_y):
+    def predict_from_bytes(self, image_bytes, width, height, player_x, player_y, player_health, enemy_x, enemy_y):
         try:
             # --- Preprocessing for CNN ---
             # Decode raw bytes to numpy array (H, W, 3) - RGB
@@ -182,12 +187,12 @@ class EnsembleAgent:
             # --- Ensemble Prediction ---
             all_logits = []
             with torch.no_grad():
-                for model, info, scaler in self.models_with_info:
+                for i, (model, info, scaler) in enumerate(self.models_with_info):
                     # --- Feature Engineering per Model (to use correct scaler) ---
                     required_features = info.get('feature_columns', ['x_position', 'y_position', 'enemy_x', 'enemy_y'])
                     
                     if len(required_features) > 4:
-                        other_features = self._engineer_features_inference(player_x, player_y, enemy_x, enemy_y, scaler=scaler)
+                        other_features = self._engineer_features_inference(player_x, player_y, player_health, enemy_x, enemy_y, scaler=scaler)
                     else:
                         other_features = torch.FloatTensor([player_x, player_y, enemy_x, enemy_y]).unsqueeze(0).to(self.device)
 
@@ -213,9 +218,25 @@ class EnsembleAgent:
                     
                     stack_np = np.stack(processed_frames, axis=0)
                     image_tensor = torch.from_numpy(stack_np).float().to(self.device) / 255.0
+                    
+                    # (C, H, W) -> (1, C, H, W) -> (1, 1, C, H, W) for LSTM if needed
                     image_tensor = image_tensor.unsqueeze(0)
                     
-                    logits = model(image_tensor, other_features)
+                    model_class = info.get('model_class', 'ResNetBehavioralCloningNet')
+                    
+                    if model_class == 'ResNetLSTMBehavioralCloningNet':
+                        # Add sequence dimension: (Batch, Seq, C, H, W)
+                        image_tensor = image_tensor.unsqueeze(1)
+                        # Add sequence dimension to features: (Batch, Seq, Feat)
+                        other_features = other_features.unsqueeze(1)
+                        
+                        logits, new_hidden = model(image_tensor, other_features, self.hidden_states[i])
+                        self.hidden_states[i] = new_hidden
+                        # Remove sequence dimension from output: (1, 1, Actions) -> (1, Actions)
+                        logits = logits.squeeze(1)
+                    else:
+                        logits = model(image_tensor, other_features)
+                        
                     all_logits.append(logits)
             
             avg_logits = torch.stack(all_logits).mean(dim=0)
@@ -225,7 +246,7 @@ class EnsembleAgent:
             thresholds = {
                 'moving_left': 0.5, 'moving_right': 0.5,
                 'moving_up': 0.5, 'moving_down': 0.5,
-                'attacking': 0.5, 'jumping': 0.5, 'dashing': 0.5
+                'attacking': 0.5, 'jumping': 0.5, 'dashing': 0.5, 'casting': 0.5
             }
             
             for i, col in enumerate(self.action_columns):
@@ -327,16 +348,17 @@ def main():
             elif line.startswith("PREDICT_RAW:"):
                 try:
                     parts = line.split(':')
-                    if len(parts) >= 7:
+                    if len(parts) >= 8:
                         width, height = int(parts[1]), int(parts[2])
                         pX, pY = float(parts[3]), float(parts[4])
-                        eX, eY = float(parts[5]), float(parts[6])
+                        pH = float(parts[5])
+                        eX, eY = float(parts[6]), float(parts[7])
                         
                         # --- REMOVED NORMALIZATION ---
-                        # Used to be: norm_pX = pX / 1920.0
                         # Now passing RAW values:
                         raw_pX = pX
                         raw_pY = pY
+                        raw_pH = pH
                         raw_eX = eX
                         raw_eY = eY
 
@@ -353,7 +375,7 @@ def main():
                         
                         active_actions, predictions_array = agent.predict_from_bytes(
                             bytes(image_bytes), width, height,
-                            player_x=raw_pX, player_y=raw_pY,
+                            player_x=raw_pX, player_y=raw_pY, player_health=raw_pH,
                             enemy_x=raw_eX, enemy_y=raw_eY
                         )
                         dt = (time.time() - t0) * 1000
@@ -364,12 +386,12 @@ def main():
                         
                         action_names = agent.action_columns
                         full_action_str = ", ".join([f"{name}={prob:.2f}" for name, prob in zip(action_names, predictions_array)])
-                        features_str = f"P({pX:.1f},{pY:.1f}) E({eX:.1f},{eY:.1f}) Img={img_mean:.1f}/{img_std:.1f}"
+                        features_str = f"P({pX:.1f},{pY:.1f}) H({pH}) E({eX:.1f},{eY:.1f}) Img={img_mean:.1f}/{img_std:.1f}"
                         
                         print(f"KEYS:{','.join(active_actions)} | {dt:.1f}ms | Feat: {features_str} | Probs: {full_action_str}")
                         sys.stdout.flush()
                     else:
-                        raise ValueError(f"Expected 7 parts but got {len(parts)}")
+                        raise ValueError(f"Expected 8 parts but got {len(parts)}")
 
                 except Exception as e:
                     print(f"ERROR:Invalid PREDICT_RAW format - {e}", file=sys.stderr)

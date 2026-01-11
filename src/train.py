@@ -76,16 +76,19 @@ def engineer_features(df):
     # 6. Temporal Stacking (Locality for 3 frames)
     # We create history for scalar features so that shuffling rows doesn't break the context
     cols_to_shift = [
-        'x_position', 'y_position', 'enemy_x', 'enemy_y',
+        'x_position', 'y_position', 'health', 'enemy_x', 'enemy_y',
         'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
         'rel_x', 'rel_y', 'enemy_distance'
     ]
-    action_cols = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing']
+    action_cols = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting']
     
     # Backward compatibility: Ensure new columns exist
-    for col in ['moving_up', 'moving_down']:
+    for col in ['moving_up', 'moving_down', 'casting']:
         if col not in df.columns:
             df[col] = 0
+            
+    if 'health' not in df.columns:
+        df['health'] = 5 # Default assumption for old data
 
     for col in cols_to_shift + action_cols:
         df[f'{col}_t1'] = df[col].shift(1).fillna(0)
@@ -97,31 +100,43 @@ class HollowKnightDataset(Dataset):
     """
     Dataset for Hollow Knight behavioral cloning.
     Prepares image and positional data for the CNN model.
-    Supports frame stacking for temporal context.
+    Supports frame stacking and sequence generation for LSTM.
     """
-    def __init__(self, data_df, transform=None, image_size=(80, 60), n_frames=1, feature_columns=None):
-        self.data = data_df.copy().reset_index(drop=True) # Reset index to align with 0..N-1 access
+    def __init__(self, data_df, transform=None, image_size=(80, 60), n_frames=1, sequence_length=1, feature_columns=None):
+        self.data = data_df.copy().reset_index(drop=True)
         self.transform = transform
         self.image_size = image_size
         self.n_frames = n_frames
-        self.action_columns = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing']
+        self.sequence_length = sequence_length
+        self.action_columns = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting']
         
-        # Default features if none provided (for backward compatibility)
         if feature_columns is None:
             self.feature_columns = ['x_position', 'y_position', 'enemy_x', 'enemy_y']
         else:
             self.feature_columns = feature_columns
-            
+
         # Verify features exist
         missing_cols = [c for c in self.feature_columns if c not in self.data.columns]
         if missing_cols:
             raise ValueError(f"Missing feature columns in dataframe: {missing_cols}")
-        
-        # Note: Filtering is now done externally before passing data_df to ensure sampler sync
-
+            
         if not self.image_size:
             self.image_size = self._get_original_image_size()
-        
+
+        # Pre-compute valid indices for sequences
+        self.valid_indices = []
+        if self.sequence_length > 1:
+            if 'session_id' not in self.data.columns:
+                 # Fallback if session_id is missing (treat as one session)
+                 self.valid_indices = list(range(len(self.data) - self.sequence_length + 1))
+            else:
+                # We need valid sequences where all frames belong to the same session
+                for i in range(len(self.data) - self.sequence_length + 1):
+                    if self.data.iloc[i]['session_id'] == self.data.iloc[i + self.sequence_length - 1]['session_id']:
+                        self.valid_indices.append(i)
+        else:
+            self.valid_indices = list(range(len(self.data)))
+
     def _get_original_image_size(self):
         if len(self.data) > 0:
             first_frame_path = self.data['frame_path'].iloc[0]
@@ -136,59 +151,147 @@ class HollowKnightDataset(Dataset):
         return os.path.join(dir_name, f"frame_{prev_id:06d}.png")
     
     def __len__(self):
-        return len(self.data)
+        return len(self.valid_indices)
     
     def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        current_frame_id = row['frame_id']
-        current_frame_path = row['frame_path']
+        start_idx = self.valid_indices[idx]
         
-        frames = []
+        # Output shapes: (Seq, Stack*C, H, W), (Seq, Feats), (Seq, Actions)
+        seq_images = []
+        seq_features = []
+        seq_actions = []
+
+        range_end = start_idx + self.sequence_length
         
-        for i in range(self.n_frames):
-            if i == 0:
-                path = current_frame_path
-            else:
-                path = self._get_previous_frame_path(current_frame_path, current_frame_id, i)
+        for i in range(start_idx, range_end):
+            row = self.data.iloc[i]
+            current_frame_id = row['frame_id']
+            current_frame_path = row['frame_path']
             
-            if os.path.exists(path):
-                with Image.open(path).convert('L') as img:
-                    # Apply resize if not using transforms, or if we need a specific size
-                    if self.image_size and not self.transform:
-                        img = img.resize(self.image_size, Image.Resampling.LANCZOS)
-                    
-                    if self.transform:
-                        # transforms expect PIL or Tensor
-                        img_tensor = self.transform(img)
-                        if not isinstance(img_tensor, torch.Tensor):
-                             img_tensor = transforms.ToTensor()(img_tensor)
-                    else:
-                        img_tensor = transforms.ToTensor()(img)
-                    
-                    frames.append(img_tensor)
-            else:
-                if frames:
-                    frames.append(frames[-1])
+            frames = []
+            for j in range(self.n_frames):
+                if j == 0:
+                    path = current_frame_path
                 else:
-                    h, w = self.image_size[1], self.image_size[0]
-                    frames.append(torch.zeros(1, h, w))
+                    path = self._get_previous_frame_path(current_frame_path, current_frame_id, j)
+                
+                if os.path.exists(path):
+                    with Image.open(path).convert('L') as img:
+                        if self.image_size and not self.transform:
+                            img = img.resize(self.image_size, Image.Resampling.LANCZOS)
+                        
+                        if self.transform:
+                            img_tensor = self.transform(img)
+                            if not isinstance(img_tensor, torch.Tensor):
+                                 img_tensor = transforms.ToTensor()(img_tensor)
+                        else:
+                            img_tensor = transforms.ToTensor()(img)
+                        frames.append(img_tensor)
+                else:
+                    if frames:
+                        frames.append(frames[-1])
+                    else:
+                        h, w = self.image_size[1], self.image_size[0]
+                        frames.append(torch.zeros(1, h, w))
 
-        image_stack = torch.cat(frames, dim=0)
-        
-        # Dynamic feature extraction
-        other_features = torch.FloatTensor([float(row[col]) for col in self.feature_columns])
-        
-        actions = torch.FloatTensor([float(row[col]) for col in self.action_columns])
-        
-        return image_stack, other_features, actions
+            image_stack = torch.cat(frames, dim=0)
+            other_features = torch.FloatTensor([float(row[col]) for col in self.feature_columns])
+            actions = torch.FloatTensor([float(row[col]) for col in self.action_columns])
+            
+            seq_images.append(image_stack)
+            seq_features.append(other_features)
+            seq_actions.append(actions)
+            
+        return torch.stack(seq_images), torch.stack(seq_features), torch.stack(seq_actions)
 
+
+class ResNetLSTMBehavioralCloningNet(nn.Module):
+    """
+    ResNet + LSTM architecture for temporal behavioral cloning.
+    Processes a sequence of frames and outputs a sequence of actions.
+    """
+    def __init__(self, image_shape=(3, 160, 320), other_features_dim=4, num_actions=8, hidden_dim=256, num_layers=1, dropout_rate=0.5):
+        super(ResNetLSTMBehavioralCloningNet, self).__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        # Encoder (ResNet18)
+        self.resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        
+        original_first_conv = self.resnet.conv1
+        if image_shape[0] != 3:
+            self.resnet.conv1 = nn.Conv2d(
+                in_channels=image_shape[0], 
+                out_channels=original_first_conv.out_channels,
+                kernel_size=original_first_conv.kernel_size,
+                stride=original_first_conv.stride,
+                padding=original_first_conv.padding,
+                bias=original_first_conv.bias is not None
+            )
+            nn.init.kaiming_normal_(self.resnet.conv1.weight, mode='fan_out', nonlinearity='relu')
+        
+        self.num_ftrs = self.resnet.fc.in_features
+        self.resnet.fc = nn.Identity()
+        
+        # Fusion
+        self.fusion_dim = 256
+        self.fusion_fc = nn.Linear(self.num_ftrs + other_features_dim, self.fusion_dim)
+        self.bn1 = nn.BatchNorm1d(self.fusion_dim)
+        self.dropout = nn.Dropout(dropout_rate)
+        
+        # LSTM
+        self.lstm = nn.LSTM(
+            input_size=self.fusion_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True
+        )
+        
+        # Head
+        self.final_fc = nn.Linear(hidden_dim, num_actions)
+
+    def forward(self, images, other_features, hidden=None):
+        """
+        images: (Batch, Seq, Channels, H, W)
+        other_features: (Batch, Seq, FeatDim)
+        """
+        batch_size, seq_len, C, H, W = images.size()
+        
+        # 1. Flatten Batch and Sequence for CNN
+        # (B*S, C, H, W)
+        cnn_in = images.view(batch_size * seq_len, C, H, W)
+        feat_in = other_features.view(batch_size * seq_len, -1)
+        
+        # 2. Extract Features
+        cnn_out = self.resnet(cnn_in)
+        
+        # 3. Fuse
+        combined = torch.cat([cnn_out, feat_in], dim=1)
+        fused = F.relu(self.bn1(self.fusion_fc(combined)))
+        fused = self.dropout(fused)
+        
+        # 4. Reshape for LSTM
+        # (B, S, FusionDim)
+        lstm_in = fused.view(batch_size, seq_len, -1)
+        
+        # 5. LSTM
+        lstm_out, hidden = self.lstm(lstm_in, hidden)
+        
+        # 6. Final FC
+        # (B, S, Hidden) -> (B*S, Hidden) -> FC -> (B, S, Actions)
+        fc_in = lstm_out.reshape(batch_size * seq_len, -1)
+        out = self.final_fc(fc_in)
+        out = out.view(batch_size, seq_len, -1)
+        
+        return out, hidden
 
 class ResNetBehavioralCloningNet(nn.Module):
     """
     ResNet-based CNN for multi-label behavioral cloning.
     Uses a ResNet18 backbone for better feature extraction.
     """
-    def __init__(self, image_shape=(3, 160, 320), other_features_dim=4, num_actions=7, dropout_rate=0.5):
+    def __init__(self, image_shape=(3, 160, 320), other_features_dim=4, num_actions=8, dropout_rate=0.5):
         super(ResNetBehavioralCloningNet, self).__init__()
         
         # Load Pretrained ResNet18
@@ -268,8 +371,8 @@ class BehavioralCloningTrainer:
         self.model.eval()
         val_loss, exact_matches, total_samples = 0, 0, 0
         total_correct_bits = 0
-        action_correct = torch.zeros(7, device=self.device)
-        action_total = torch.zeros(7, device=self.device)
+        action_correct = torch.zeros(8, device=self.device)
+        action_total = torch.zeros(8, device=self.device)
         
         all_labels = []
         all_preds = []
@@ -279,7 +382,17 @@ class BehavioralCloningTrainer:
                 images, other_features, actions = images.to(self.device), other_features.to(self.device), actions.to(self.device)
                 
                 with amp.autocast(enabled=True):
-                    outputs = self.model(images, other_features)
+                    # Handle LSTM tuple return
+                    if isinstance(self.model, ResNetLSTMBehavioralCloningNet):
+                        outputs, _ = self.model(images, other_features)
+                    else:
+                        outputs = self.model(images, other_features)
+                    
+                    # Flatten sequence dimension for loss
+                    if outputs.dim() == 3:
+                        outputs = outputs.reshape(-1, outputs.size(-1))
+                        actions = actions.reshape(-1, actions.size(-1))
+                        
                     loss = criterion(outputs, actions)
                 
                 val_loss += loss.item()
@@ -294,13 +407,13 @@ class BehavioralCloningTrainer:
                 total_correct_bits += (predicted == actions).sum().item()
                 total_samples += actions.size(0)
                 
-                for i in range(7):
+                for i in range(8):
                     action_correct[i] += (predicted[:, i] == actions[:, i]).sum().item()
                     action_total[i] += actions.size(0)
         
         avg_val_loss = val_loss / len(val_loader)
         exact_match_accuracy = exact_matches / total_samples
-        partial_match_accuracy = total_correct_bits / (total_samples * 7)
+        partial_match_accuracy = total_correct_bits / (total_samples * 8)
         per_action_acc = [corr.item() / total.item() if total.item() > 0 else 0 for corr, total in zip(action_correct, action_total)]
         
         # Concatenate for global metrics
@@ -341,7 +454,7 @@ class BehavioralCloningTrainer:
     def plot_training_history(self, save_path='training_history.png'):
         if not self.train_losses: return
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        action_names = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing']
+        action_names = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting']
         
         axes[0, 0].plot(self.train_losses, label='Training Loss')
         axes[0, 0].plot(self.val_losses, label='Validation Loss')
@@ -410,7 +523,17 @@ class BehavioralCloningTrainer:
                 optimizer.zero_grad()
                 
                 with amp.autocast(enabled=True):
-                    outputs = self.model(images, other_features)
+                    # Handle LSTM tuple return
+                    if isinstance(self.model, ResNetLSTMBehavioralCloningNet):
+                        outputs, _ = self.model(images, other_features)
+                    else:
+                        outputs = self.model(images, other_features)
+                    
+                    # Flatten sequence dimension for loss
+                    if outputs.dim() == 3:
+                        outputs = outputs.view(-1, outputs.size(-1))
+                        actions = actions.view(-1, actions.size(-1))
+                        
                     loss = criterion(outputs, actions)
                 
                 self.scaler.scale(loss).backward()
@@ -478,9 +601,11 @@ def export_model_for_inference(model, image_size, n_frames, feature_columns, thr
         'image_shape': [n_frames, image_size[1], image_size[0]],
         'other_features_dim': len(feature_columns),
         'feature_columns': feature_columns,
-        'num_actions': 7,
-        'action_columns': ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing'],
+        'num_actions': 8,
+        'action_columns': ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting'],
         'n_frames': n_frames,
+        'sequence_length': getattr(model, 'sequence_length', 1),
+        'hidden_dim': getattr(model, 'hidden_dim', 256),
         'thresholds': thresholds
     }
     
@@ -516,11 +641,21 @@ def load_model_for_inference(model_dir='model'):
         scaler.var_ = scaler.scale_ ** 2
         scaler.n_samples_seen_ = 1000 # Dummy value
 
-    model = ResNetBehavioralCloningNet(
-        image_shape=tuple(model_info['image_shape']),
-        other_features_dim=other_features_dim,
-        num_actions=model_info['num_actions']
-    )
+    model_class = model_info.get('model_class', 'ResNetBehavioralCloningNet')
+    
+    if model_class == 'ResNetLSTMBehavioralCloningNet':
+        model = ResNetLSTMBehavioralCloningNet(
+            image_shape=tuple(model_info['image_shape']),
+            other_features_dim=other_features_dim,
+            num_actions=model_info['num_actions'],
+            hidden_dim=model_info.get('hidden_dim', 256)
+        )
+    else:
+        model = ResNetBehavioralCloningNet(
+            image_shape=tuple(model_info['image_shape']),
+            other_features_dim=other_features_dim,
+            num_actions=model_info['num_actions']
+        )
     
     weights_path = os.path.join(model_dir, 'model.pth')
     model.load_state_dict(torch.load(weights_path, map_location=torch.device('cpu')))
@@ -539,6 +674,7 @@ def main():
     MAX_TRIALS = 100
     MIN_ACTION_ACCURACY = 0.5
     STACK_SIZE = 3 
+    SEQUENCE_LENGTH = 8 
     
     BASE_LOG_DIR = os.path.join("runs", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
     os.makedirs(BASE_LOG_DIR, exist_ok=True)
@@ -565,6 +701,9 @@ def main():
             df = pd.read_csv(os.path.join(DATA_DIR, csv_file))
             df['frame_path'] = df['frame_id'].apply(lambda x: os.path.join(frames_dir, f"frame_{x:06d}.png"))
             
+            # Add session_id
+            df['session_id'] = session_id
+            
             # Filter missing files upfront to prevent Sampler misalignment
             valid_mask = df['frame_path'].apply(os.path.exists)
             df = df[valid_mask].copy()
@@ -578,25 +717,25 @@ def main():
 
     # Define the full set of 19 + (16*2) features = 51 features
     base_features = [
-        'x_position', 'y_position', 'enemy_x', 'enemy_y', 
+        'x_position', 'y_position', 'health', 'enemy_x', 'enemy_y', 
         'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy', 
         'player_speed', 'enemy_distance', 
         'rel_x', 'rel_y', 'vel_diff_x', 'vel_diff_y',
-        'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing'
+        'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting'
     ]
     
     feature_columns = base_features.copy()
     for col in [
-        'x_position', 'y_position', 'enemy_x', 'enemy_y',
+        'x_position', 'y_position', 'health', 'enemy_x', 'enemy_y',
         'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
         'rel_x', 'rel_y', 'enemy_distance',
-        'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing'
+        'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting'
     ]:
         feature_columns.append(f'{col}_t1')
         feature_columns.append(f'{col}_t2')
     
     # Filter out columns that aren't inputs (labels are target, but here we use history as input)
-    input_feature_columns = [c for c in feature_columns if c not in ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing']]
+    input_feature_columns = [c for c in feature_columns if c not in ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting']]
     
     print(f"Using {len(input_feature_columns)} input features.")
 
@@ -607,6 +746,7 @@ def main():
 
     print(f"\n--- Searching for {NUM_MODELS_TO_FIND} 'Good' Models (Min Action Accuracy > {MIN_ACTION_ACCURACY}) ---")
     print(f"Frame Stacking: {STACK_SIZE}")
+    print(f"Sequence Length: {SEQUENCE_LENGTH}")
     print(f"TensorBoard Logs: {BASE_LOG_DIR}")
     
     search_space = {
@@ -615,7 +755,8 @@ def main():
         'weight_decay': [1e-4, 5e-4],
         'loss_type': ['focal'],
         'image_size': [(224, 224)], # ResNet standard size works well
-        'batch_size': [32, 48]
+        'batch_size': [16, 24], 
+        'hidden_dim': [256, 512]
     }
     
     saved_models_count = 0
@@ -635,28 +776,15 @@ def main():
         train_df = train_df.reset_index(drop=True)
         val_df = val_df.reset_index(drop=True)
 
-        # --- Imbalance Handling: Weighted Random Sampler ---
-        action_columns = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing']
-        class_counts = train_df[action_columns].sum().replace(0, 1) 
-        class_weights_series = len(train_df) / class_counts
+        # Sequence-based training means simple WeightedRandomSampler is hard.
+        # We disable it for now and rely on shuffling + Focal Loss.
         
-        sample_weights = train_df[action_columns].mul(class_weights_series).sum(axis=1)
-        is_idle = (train_df[action_columns] == 0).all(axis=1)
-        idle_count = is_idle.sum()
-        idle_weight = len(train_df) / idle_count if idle_count > 0 else 1.0
-        sample_weights[is_idle] = idle_weight
-        
-        sampler = WeightedRandomSampler(
-            weights=sample_weights.values,
-            num_samples=len(train_df),
-            replacement=True
-        )
-
         train_trial_dataset = HollowKnightDataset(
             data_df=train_df,
             image_size=hp['image_size'],
             transform=get_transforms(hp['image_size'], is_train=True),
             n_frames=STACK_SIZE,
+            sequence_length=SEQUENCE_LENGTH,
             feature_columns=input_feature_columns
         )
         val_trial_dataset = HollowKnightDataset(
@@ -664,6 +792,7 @@ def main():
             image_size=hp['image_size'],
             transform=get_transforms(hp['image_size'], is_train=False), 
             n_frames=STACK_SIZE,
+            sequence_length=SEQUENCE_LENGTH,
             feature_columns=input_feature_columns
         )
         
@@ -674,8 +803,8 @@ def main():
         train_loader = DataLoader(
             train_trial_dataset, 
             batch_size=hp['batch_size'], 
-            sampler=sampler, 
-            shuffle=False 
+            shuffle=True, 
+            num_workers=0
         )
         val_loader = DataLoader(
             val_trial_dataset, 
@@ -683,11 +812,13 @@ def main():
             shuffle=False
         )
         
-        model = BehavioralCloningNet(
+        model = ResNetLSTMBehavioralCloningNet(
             image_shape=(STACK_SIZE, hp['image_size'][1], hp['image_size'][0]), 
             other_features_dim=len(input_feature_columns),
-            dropout_rate=hp['dropout_rate']
+            dropout_rate=hp['dropout_rate'],
+            hidden_dim=hp['hidden_dim']
         )
+        model.sequence_length = SEQUENCE_LENGTH
         
         trial_log_dir = os.path.join(BASE_LOG_DIR, f"trial_{trial+1}")
         

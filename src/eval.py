@@ -17,7 +17,7 @@ import torch
 from torch.utils.data import DataLoader
 
 # Import the correct, up-to-date classes and functions from train.py
-from train import BehavioralCloningNet, HollowKnightDataset, load_model_for_inference, engineer_features
+from train import BehavioralCloningNet, ResNetLSTMBehavioralCloningNet, HollowKnightDataset, load_model_for_inference, engineer_features
 
 warnings.filterwarnings('ignore')
 
@@ -166,12 +166,14 @@ def get_predictions(models_with_info, master_df, device='cpu'):
     final_frame_ids = None
 
     class TempEvalDataset(HollowKnightDataset):
-        def __init__(self, data_df, image_size, n_frames, feature_columns):
-            super().__init__(data_df=data_df, image_size=image_size, n_frames=n_frames, feature_columns=feature_columns)
+        def __init__(self, data_df, image_size, n_frames, sequence_length, feature_columns):
+            super().__init__(data_df=data_df, image_size=image_size, n_frames=n_frames, sequence_length=sequence_length, feature_columns=feature_columns)
 
         def __getitem__(self, idx):
             img, other_features, actions = super().__getitem__(idx)
-            frame_id = self.data.iloc[idx]['frame_id']
+            # If sequence, we take the last frame_id of the sequence for reference
+            start_idx = self.valid_indices[idx]
+            frame_id = self.data.iloc[start_idx + self.sequence_length - 1]['frame_id']
             return img, other_features, actions, frame_id
 
     for i, (model, info, scaler) in enumerate(models_with_info):
@@ -181,6 +183,7 @@ def get_predictions(models_with_info, master_df, device='cpu'):
 
         # Handle legacy models or different shapes
         n_frames = info.get('n_frames', 1)
+        sequence_length = info.get('sequence_length', 1)
         if 'image_shape' in info and len(info['image_shape']) == 3:
             n_frames = max(n_frames, info['image_shape'][0])
             
@@ -189,9 +192,15 @@ def get_predictions(models_with_info, master_df, device='cpu'):
         image_size = (target_w, target_h) # PIL uses (W, H)
         feature_columns = info.get('feature_columns', ['x_position', 'y_position', 'enemy_x', 'enemy_y'])
 
-        print(f"Using image size: {image_size}, n_frames: {n_frames}")
+        print(f"Using image size: {image_size}, n_frames: {n_frames}, seq_len: {sequence_length}")
 
-        temp_dataset = TempEvalDataset(data_df=master_df.copy(), image_size=image_size, n_frames=n_frames, feature_columns=feature_columns)
+        temp_dataset = TempEvalDataset(
+            data_df=master_df.copy(), 
+            image_size=image_size, 
+            n_frames=n_frames, 
+            sequence_length=sequence_length,
+            feature_columns=feature_columns
+        )
         temp_loader = DataLoader(temp_dataset, batch_size=64, shuffle=False)
         
         current_model_labels, current_model_preds, current_model_frame_ids, current_model_embeddings = [], [], [], []
@@ -200,26 +209,41 @@ def get_predictions(models_with_info, master_df, device='cpu'):
             for images, other_features, labels, frame_ids in tqdm(temp_loader, desc=f"Model {i+1} Predictions"):
                 images, labels = images.to(device), labels.to(device)
                 
-                # Apply scaling
                 if scaler:
-                    # other_features is tensor (Batch, Features)
-                    # Convert to numpy, transform, back to tensor
-                    feat_np = other_features.numpy()
-                    feat_scaled = scaler.transform(feat_np)
-                    other_features = torch.FloatTensor(feat_scaled).to(device)
+                    # Scaling needs to be applied carefully.
+                    # other_features is (B, S, F) or (B, F)
+                    # Scaler expects 2D.
+                    original_shape = other_features.shape
+                    feat_flat = other_features.view(-1, original_shape[-1]).numpy()
+                    feat_scaled = scaler.transform(feat_flat)
+                    other_features = torch.FloatTensor(feat_scaled).view(original_shape).to(device)
                 else:
                     other_features = other_features.to(device)
 
-                # Manually run forward pass to get embeddings (ResNet specific)
-                x = model.resnet(images) # (Batch, 512) 
-                
-                combined = torch.cat([x, other_features], dim=1)
-                
-                # Get embedding (penultimate layer output)
-                embedding = torch.nn.functional.relu(model.bn1(model.fusion_fc(combined)))
-                
-                # Get final prediction
-                output = model.final_fc(model.dropout(embedding))
+                # Handle LSTM
+                if isinstance(model, ResNetLSTMBehavioralCloningNet):
+                    # Output is (B, S, Actions)
+                    outputs, _ = model(images, other_features)
+                    # We might want the predictions for the WHOLE sequence or just the last step?
+                    # Usually for eval we check every step.
+                    # But the Dataset yields overlapping sequences?
+                    # HollowKnightDataset with seq>1 yields windowed sequences (stride 1).
+                    # So for every index, we get a sequence. 
+                    # The label returned by dataset is also a sequence.
+                    # We can evaluate the LAST item in the sequence (most context).
+                    output = outputs[:, -1, :]
+                    labels = labels[:, -1, :]
+                    
+                    # Embedding? We can use the last hidden state or fusion output.
+                    # For simplicity, let's skip embedding visualization for LSTM for now or use the LSTM output before head
+                    embedding = torch.zeros(outputs.size(0), 256).to(device) # Dummy
+                else:
+                    # Standard ResNet
+                    x = model.resnet(images) 
+                    combined = torch.cat([x, other_features], dim=1)
+                    embedding = torch.nn.functional.relu(model.bn1(model.fusion_fc(combined)))
+                    output = model.final_fc(model.dropout(embedding))
+
                 probabilities = torch.sigmoid(output)
 
                 current_model_labels.append(labels.cpu().numpy())

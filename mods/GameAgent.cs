@@ -36,6 +36,7 @@ namespace GameAgent
             public byte[] pixels;
             public float playerX;
             public float playerY;
+            public int playerHealth;
             public float enemyX;
             public float enemyY;
         }
@@ -207,6 +208,7 @@ namespace GameAgent
                 
                 // 4. Get position data
                 Vector3 playerPos = HeroController.instance != null ? HeroController.instance.transform.position : Vector3.zero;
+                int health = PlayerData.instance != null ? PlayerData.instance.health : 5;
                 GameObject enemy = FindCurrentEnemy();
                 Vector3 enemyPos = enemy != null ? enemy.transform.position : Vector3.zero;
 
@@ -215,6 +217,7 @@ namespace GameAgent
                     pixels = rawRgb,
                     playerX = playerPos.x,
                     playerY = playerPos.y,
+                    playerHealth = health,
                     enemyX = enemyPos.x,
                     enemyY = enemyPos.y
                 };
@@ -265,11 +268,12 @@ namespace GameAgent
                             // Protocol: Send Header -> Flush -> Send Raw Bytes -> Flush
                             string pX = frame.playerX.ToString(System.Globalization.CultureInfo.InvariantCulture);
                             string pY = frame.playerY.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                            string pH = frame.playerHealth.ToString(System.Globalization.CultureInfo.InvariantCulture);
                             string eX = frame.enemyX.ToString(System.Globalization.CultureInfo.InvariantCulture);
                             string eY = frame.enemyY.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
                             // Header now implies RGB data (width * height * 3 bytes)
-                            string header = $"PREDICT_RAW:{targetWidth}:{targetHeight}:{pX}:{pY}:{eX}:{eY}\n";
+                            string header = $"PREDICT_RAW:{targetWidth}:{targetHeight}:{pX}:{pY}:{pH}:{eX}:{eY}\n";
                             byte[] headerBytes = Encoding.UTF8.GetBytes(header);
                             
                             pythonProcess.StandardInput.BaseStream.Write(headerBytes, 0, headerBytes.Length);

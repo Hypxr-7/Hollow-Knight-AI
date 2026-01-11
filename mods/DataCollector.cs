@@ -298,7 +298,8 @@ namespace DataCollector
                 MovingDown = actionStates.MovingDown,
                 Attacking = actionStates.Attacking,
                 Jumping = actionStates.Jumping,
-                Dashing = actionStates.Dashing
+                Dashing = actionStates.Dashing,
+                Casting = actionStates.Casting
             };
         }
 
@@ -332,7 +333,8 @@ namespace DataCollector
                 MovingDown = input.Vertical < -deadzoneThreshold,
                 Attacking = heroController.cState.attacking,
                 Jumping = heroController.cState.jumping,
-                Dashing = heroController.cState.dashing
+                Dashing = heroController.cState.dashing,
+                Casting = heroController.cState.focusing || heroController.cState.casting || heroController.cState.spellQuake
             };
         }
 
@@ -380,10 +382,10 @@ namespace DataCollector
 
         private string FormatDataRow(PlayerDataSnapshot player, InputDataSnapshot input, EnemyDataSnapshot enemy)
         {
-            return $"{frameCount},{player.Position.x:F3},{player.Position.y:F3}," +
+            return $"{frameCount},{player.Position.x:F3},{player.Position.y:F3},{player.Health}," +
                    $"{enemy.Position.x:F3},{enemy.Position.y:F3}," +
                    $"{input.MovingLeft},{input.MovingRight},{input.MovingUp},{input.MovingDown}," +
-                   $"{input.Attacking},{input.Jumping},{input.Dashing}";
+                   $"{input.Attacking},{input.Jumping},{input.Dashing},{input.Casting}";
         }
         #endregion
 
@@ -424,9 +426,9 @@ namespace DataCollector
         #region File Operations
         private void WriteCSVHeader()
         {
-            const string header = "frame_id,x_position,y_position,enemy_x,enemy_y," +
+            const string header = "frame_id,x_position,y_position,health,enemy_x,enemy_y," +
                                 "moving_left,moving_right,moving_up,moving_down," +
-                                "attacking,jumping,dashing";
+                                "attacking,jumping,dashing,casting";
             File.WriteAllText(csvFilePath, header + "\n");
         }
         #endregion
@@ -447,6 +449,7 @@ namespace DataCollector
             public bool Attacking { get; set; }
             public bool Jumping { get; set; }
             public bool Dashing { get; set; }
+            public bool Casting { get; set; }
         }
 
         private class EnemyDataSnapshot
@@ -476,6 +479,7 @@ namespace DataCollector
             public bool Attacking { get; set; }
             public bool Jumping { get; set; }
             public bool Dashing { get; set; }
+            public bool Casting { get; set; }
         }
 
         private class ScaleDimensions
