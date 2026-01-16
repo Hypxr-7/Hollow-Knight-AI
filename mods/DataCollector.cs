@@ -299,7 +299,8 @@ namespace DataCollector
                 Attacking = actionStates.Attacking,
                 Jumping = actionStates.Jumping,
                 Dashing = actionStates.Dashing,
-                Casting = actionStates.Casting
+                Focusing = actionStates.Focusing,
+                CastSpell = actionStates.CastSpell
             };
         }
 
@@ -327,14 +328,15 @@ namespace DataCollector
 
             return new ActionStates
             {
-                MovingLeft = input.Horizontal < -deadzoneThreshold || Input.GetKey(KeyCode.Joystick1Button14),
-                MovingRight = input.Horizontal > deadzoneThreshold || Input.GetKey(KeyCode.Joystick1Button15),
-                MovingUp = input.Vertical > deadzoneThreshold,
-                MovingDown = input.Vertical < -deadzoneThreshold,
+                MovingLeft = input.Horizontal < -deadzoneThreshold || Input.GetKey(KeyCode.JoystickButton14),
+                MovingRight = input.Horizontal > deadzoneThreshold || Input.GetKey(KeyCode.JoystickButton15),
+                MovingUp = input.Vertical > deadzoneThreshold || Input.GetKey(KeyCode.JoystickButton12),
+                MovingDown = input.Vertical < -deadzoneThreshold || Input.GetKey(KeyCode.JoystickButton13),
                 Attacking = heroController.cState.attacking,
                 Jumping = heroController.cState.jumping,
                 Dashing = heroController.cState.dashing,
-                Casting = heroController.cState.focusing || heroController.cState.casting || heroController.cState.spellQuake
+                Focusing = heroController.cState.focusing,
+                CastSpell = heroController.cState.casting || heroController.cState.spellQuake
             };
         }
 
@@ -385,7 +387,7 @@ namespace DataCollector
             return $"{frameCount},{player.Position.x:F3},{player.Position.y:F3},{player.Health}," +
                    $"{enemy.Position.x:F3},{enemy.Position.y:F3}," +
                    $"{input.MovingLeft},{input.MovingRight},{input.MovingUp},{input.MovingDown}," +
-                   $"{input.Attacking},{input.Jumping},{input.Dashing},{input.Casting}";
+                   $"{input.Attacking},{input.Jumping},{input.Dashing},{input.Focusing},{input.CastSpell}";
         }
         #endregion
 
@@ -427,7 +429,7 @@ namespace DataCollector
         {
             const string header = "frame_id,x_position,y_position,health,enemy_x,enemy_y," +
                                 "moving_left,moving_right,moving_up,moving_down," +
-                                "attacking,jumping,dashing,casting";
+                                "attacking,jumping,dashing,focusing,cast_spell";
             File.WriteAllText(csvFilePath, header + "\n");
         }
         #endregion
@@ -448,7 +450,8 @@ namespace DataCollector
             public bool Attacking { get; set; }
             public bool Jumping { get; set; }
             public bool Dashing { get; set; }
-            public bool Casting { get; set; }
+            public bool Focusing { get; set; }
+            public bool CastSpell { get; set; }
         }
 
         private class EnemyDataSnapshot
@@ -478,7 +481,8 @@ namespace DataCollector
             public bool Attacking { get; set; }
             public bool Jumping { get; set; }
             public bool Dashing { get; set; }
-            public bool Casting { get; set; }
+            public bool Focusing { get; set; }
+            public bool CastSpell { get; set; }
         }
 
         private class ScaleDimensions

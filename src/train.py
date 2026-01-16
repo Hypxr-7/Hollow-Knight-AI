@@ -80,10 +80,10 @@ def engineer_features(df):
         'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
         'rel_x', 'rel_y', 'enemy_distance'
     ]
-    action_cols = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting']
+    action_cols = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'focusing', 'cast_spell']
     
     # Backward compatibility: Ensure new columns exist
-    for col in ['moving_up', 'moving_down', 'casting']:
+    for col in ['moving_up', 'moving_down', 'focusing', 'cast_spell']:
         if col not in df.columns:
             df[col] = 0
             
@@ -108,7 +108,7 @@ class HollowKnightDataset(Dataset):
         self.image_size = image_size
         self.n_frames = n_frames
         self.sequence_length = sequence_length
-        self.action_columns = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting']
+        self.action_columns = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'focusing', 'cast_spell']
         
         if feature_columns is None:
             self.feature_columns = ['x_position', 'y_position', 'enemy_x', 'enemy_y']
@@ -210,7 +210,7 @@ class ResNetLSTMBehavioralCloningNet(nn.Module):
     ResNet + LSTM architecture for temporal behavioral cloning.
     Processes a sequence of frames and outputs a sequence of actions.
     """
-    def __init__(self, image_shape=(3, 160, 320), other_features_dim=4, num_actions=8, hidden_dim=256, num_layers=1, dropout_rate=0.5):
+    def __init__(self, image_shape=(3, 160, 320), other_features_dim=4, num_actions=9, hidden_dim=256, num_layers=1, dropout_rate=0.5):
         super(ResNetLSTMBehavioralCloningNet, self).__init__()
         
         self.hidden_dim = hidden_dim
@@ -291,7 +291,7 @@ class ResNetBehavioralCloningNet(nn.Module):
     ResNet-based CNN for multi-label behavioral cloning.
     Uses a ResNet18 backbone for better feature extraction.
     """
-    def __init__(self, image_shape=(3, 160, 320), other_features_dim=4, num_actions=8, dropout_rate=0.5):
+    def __init__(self, image_shape=(3, 160, 320), other_features_dim=4, num_actions=9, dropout_rate=0.5):
         super(ResNetBehavioralCloningNet, self).__init__()
         
         # Load Pretrained ResNet18
@@ -371,8 +371,8 @@ class BehavioralCloningTrainer:
         self.model.eval()
         val_loss, exact_matches, total_samples = 0, 0, 0
         total_correct_bits = 0
-        action_correct = torch.zeros(8, device=self.device)
-        action_total = torch.zeros(8, device=self.device)
+        action_correct = torch.zeros(9, device=self.device)
+        action_total = torch.zeros(9, device=self.device)
         
         all_labels = []
         all_preds = []
@@ -407,13 +407,13 @@ class BehavioralCloningTrainer:
                 total_correct_bits += (predicted == actions).sum().item()
                 total_samples += actions.size(0)
                 
-                for i in range(8):
+                for i in range(9):
                     action_correct[i] += (predicted[:, i] == actions[:, i]).sum().item()
                     action_total[i] += actions.size(0)
         
         avg_val_loss = val_loss / len(val_loader)
         exact_match_accuracy = exact_matches / total_samples
-        partial_match_accuracy = total_correct_bits / (total_samples * 8)
+        partial_match_accuracy = total_correct_bits / (total_samples * 9)
         per_action_acc = [corr.item() / total.item() if total.item() > 0 else 0 for corr, total in zip(action_correct, action_total)]
         
         # Concatenate for global metrics
@@ -454,7 +454,7 @@ class BehavioralCloningTrainer:
     def plot_training_history(self, save_path='training_history.png'):
         if not self.train_losses: return
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        action_names = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting']
+        action_names = ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'focusing', 'cast_spell']
         
         axes[0, 0].plot(self.train_losses, label='Training Loss')
         axes[0, 0].plot(self.val_losses, label='Validation Loss')
@@ -557,8 +557,9 @@ class BehavioralCloningTrainer:
                 self.writer.add_scalar('Loss/epoch_val', val_loss, epoch)
                 self.writer.add_scalar('Accuracy/exact_match', val_accuracy, epoch)
                 self.writer.add_scalar('Accuracy/partial_match', partial_accuracy, epoch)
-                for i, name in enumerate(['Left', 'Right', 'Attack', 'Jump', 'Dash']):
-                    self.writer.add_scalar(f'Accuracy_Per_Action/{name}', per_action_acc[i], epoch)
+                for i, name in enumerate(['Left', 'Right', 'Attack', 'Jump', 'Dash', 'Focus', 'Spell']):
+                    if i < len(per_action_acc):
+                         self.writer.add_scalar(f'Accuracy_Per_Action/{name}', per_action_acc[i], epoch)
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -601,8 +602,8 @@ def export_model_for_inference(model, image_size, n_frames, feature_columns, thr
         'image_shape': [n_frames, image_size[1], image_size[0]],
         'other_features_dim': len(feature_columns),
         'feature_columns': feature_columns,
-        'num_actions': 8,
-        'action_columns': ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting'],
+        'num_actions': 9,
+        'action_columns': ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'focusing', 'cast_spell'],
         'n_frames': n_frames,
         'sequence_length': getattr(model, 'sequence_length', 1),
         'hidden_dim': getattr(model, 'hidden_dim', 256),
@@ -715,13 +716,13 @@ def main():
     master_df = pd.concat(all_dfs, ignore_index=True)
     if len(master_df) == 0: print("No valid data in master DataFrame. Exiting."); return
 
-    # Define the full set of 19 + (16*2) features = 51 features
+    # Define the full set of 19 + (18*2) features
     base_features = [
         'x_position', 'y_position', 'health', 'enemy_x', 'enemy_y', 
         'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy', 
         'player_speed', 'enemy_distance', 
         'rel_x', 'rel_y', 'vel_diff_x', 'vel_diff_y',
-        'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting'
+        'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'focusing', 'cast_spell'
     ]
     
     feature_columns = base_features.copy()
@@ -729,13 +730,13 @@ def main():
         'x_position', 'y_position', 'health', 'enemy_x', 'enemy_y',
         'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
         'rel_x', 'rel_y', 'enemy_distance',
-        'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting'
+        'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'focusing', 'cast_spell'
     ]:
         feature_columns.append(f'{col}_t1')
         feature_columns.append(f'{col}_t2')
     
     # Filter out columns that aren't inputs (labels are target, but here we use history as input)
-    input_feature_columns = [c for c in feature_columns if c not in ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting']]
+    input_feature_columns = [c for c in feature_columns if c not in ['moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'focusing', 'cast_spell']]
     
     print(f"Using {len(input_feature_columns)} input features.")
 

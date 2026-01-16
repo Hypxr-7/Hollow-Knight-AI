@@ -63,7 +63,8 @@ class EnsembleAgent:
         self.prev_actions = {
             'moving_left': 0.0, 'moving_right': 0.0, 
             'moving_up': 0.0, 'moving_down': 0.0,
-            'attacking': 0.0, 'jumping': 0.0, 'dashing': 0.0, 'casting': 0.0
+            'attacking': 0.0, 'jumping': 0.0, 'dashing': 0.0, 
+            'focusing': 0.0, 'cast_spell': 0.0
         }
         
         # Maintain history of raw metrics for 3-frame scalar stacking (locality for 3)
@@ -74,7 +75,8 @@ class EnsembleAgent:
         self.action_keys = {
             'moving_left': 'left', 'moving_right': 'right',
             'moving_up': 'up', 'moving_down': 'down',
-            'attacking': 'x', 'jumping': 'z', 'dashing': 'c', 'casting': 'a'
+            'attacking': 'x', 'jumping': 'z', 'dashing': 'c', 
+            'focusing': 'a', 'cast_spell': 'a'
         }
         self.pressed_keys = set()
         
@@ -124,7 +126,8 @@ class EnsembleAgent:
             'attacking': self.prev_actions['attacking'], 
             'jumping': self.prev_actions['jumping'], 
             'dashing': self.prev_actions['dashing'],
-            'casting': self.prev_actions['casting']
+            'focusing': self.prev_actions['focusing'],
+            'cast_spell': self.prev_actions['cast_spell']
         }
         
         # Update raw history
@@ -153,7 +156,7 @@ class EnsembleAgent:
                 'x_position', 'y_position', 'health', 'enemy_x', 'enemy_y',
                 'player_dx', 'player_dy', 'enemy_dx', 'enemy_dy',
                 'rel_x', 'rel_y', 'enemy_distance',
-                'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'casting'
+                'moving_left', 'moving_right', 'moving_up', 'moving_down', 'attacking', 'jumping', 'dashing', 'focusing', 'cast_spell'
             ]:
                 features.append(hist_point[col])
 
@@ -246,7 +249,8 @@ class EnsembleAgent:
             thresholds = {
                 'moving_left': 0.5, 'moving_right': 0.5,
                 'moving_up': 0.5, 'moving_down': 0.5,
-                'attacking': 0.5, 'jumping': 0.5, 'dashing': 0.5, 'casting': 0.5
+                'attacking': 0.5, 'jumping': 0.5, 'dashing': 0.5, 
+                'focusing': 0.5, 'cast_spell': 0.5
             }
             
             for i, col in enumerate(self.action_columns):
@@ -265,7 +269,7 @@ class EnsembleAgent:
 
     def execute_actions(self, predictions, thresholds):
         """Determine which keys to press or release based on predictions."""
-        press_action_names = {'attacking', 'dashing'}
+        press_action_names = {'attacking', 'dashing', 'cast_spell'}
 
         desired_holds = set()
         active_actions = []

@@ -93,8 +93,8 @@ def generate_gradcam_visualizations(model, dataset, action_columns, output_dir, 
     model.eval()
     
     # We want to find samples where the model strongly predicts an action
-    # Let's pick 'attacking' and 'jumping'
-    target_actions = ['attacking', 'jumping']
+    # Let's pick 'attacking', 'jumping', 'focusing', and 'cast_spell'
+    target_actions = ['attacking', 'jumping', 'focusing', 'cast_spell']
     
     for action_name in target_actions:
         if action_name not in action_columns: continue
@@ -385,7 +385,7 @@ def plot_kde(true_labels, pred_probs, action_columns, output_dir):
     for i, action in enumerate(action_columns):
         plt.figure(figsize=(10, 6))
         data = pd.DataFrame({'True Label': true_labels[:, i], 'Predicted Probability': pred_probs[:, i]})
-        sns.kdeplot(data=data, x='Predicted Probability', hue='True Label', fill=True, common_norm=False)
+        sns.kdeplot(data=data, x='Predicted Probability', hue='True Label', fill=True, common_norm=True)
         plt.title(f'Class-Conditional Density for "{action}"')
         plt.savefig(os.path.join(output_dir, f'10_kde_plot_{action}.png'))
         plt.close()
