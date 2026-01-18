@@ -336,7 +336,7 @@ namespace DataCollector
                 Jumping = heroController.cState.jumping,
                 Dashing = heroController.cState.dashing,
                 Focusing = heroController.cState.focusing,
-                CastSpell = heroController.cState.casting || heroController.cState.spellQuake
+                CastSpell = heroController.cState.casting || heroController.cState.spellQuake || Input.GetKey(KeyCode.JoystickButton1)
             };
         }
 
