@@ -326,6 +326,13 @@ namespace DataCollector
         {
             var heroController = HeroController.instance;
 
+            // Capture raw input for Focus/Cast to ensure we catch user intent even if cState is transient
+            bool rawFocusInput = Input.GetKey(KeyCode.A) || 
+                                 Input.GetKey(KeyCode.F) ||
+                                 Input.GetKey(KeyCode.JoystickButton1) || 
+                                 Input.GetKey(KeyCode.JoystickButton2) || 
+                                 Input.GetKey(KeyCode.JoystickButton3);
+
             return new ActionStates
             {
                 MovingLeft = input.Horizontal < -deadzoneThreshold || Input.GetKey(KeyCode.JoystickButton14),
@@ -335,8 +342,9 @@ namespace DataCollector
                 Attacking = heroController.cState.attacking,
                 Jumping = heroController.cState.jumping,
                 Dashing = heroController.cState.dashing,
-                Focusing = heroController.cState.focusing,
-                CastSpell = heroController.cState.casting || heroController.cState.spellQuake || Input.GetKey(KeyCode.JoystickButton1)
+                // Combine raw input with game state for robust detection
+                Focusing = rawFocusInput || heroController.cState.focusing,
+                CastSpell = rawFocusInput || heroController.cState.casting || heroController.cState.spellQuake
             };
         }
 

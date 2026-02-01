@@ -45,7 +45,7 @@ namespace GameAgent
         private ConcurrentQueue<FrameData> frameQueue = new ConcurrentQueue<FrameData>();
 
         public GameAgentMod() : base("Game Agent") { }
-        public override string GetVersion() => "T3.2-Resolution-Fixed";
+        public override string GetVersion() => "4.0";
 
         public override void Initialize()
         {
